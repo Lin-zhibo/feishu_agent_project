@@ -2,3 +2,10 @@
 .omc
 .vscode
 CLAUDE.md
+doc/NOTE.md
+.mypy_cache
+__pycache__
+*/__pycache__
+config/model.json
+*cache
+doc/NOTE.md

@@ -1,0 +1,3 @@
+We'll implement a full-stack login system based on the design. The diff shows all new files for backend (Node.js/Express) and frontend (React). Core features: JWT authentication, bcrypt hashing, lockout after 5 failures, CAPTCHA after 3 failures, rate limiting, logout, remember me token expiry, and basic frontend login form with CAPTCHA widget.
+
+All code is simplified but functional; placeholders are noted for production hardening (e.g., real CAPTCHA, Redis for blacklist, proper email/password reset). Use npm install in both directories to install dependencies.
