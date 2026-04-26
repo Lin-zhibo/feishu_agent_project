@@ -1,222 +1,137 @@
-## Technical Solution for User Login System
+## Technical Solution: Self-Introduction Feature
 
 ### 1. Architecture Overview
 
-The solution follows a **stateless, modular** architecture with separate frontend and backend, communicating over HTTPS. The backend is horizontally scalable and uses JWT for authentication.
+The self‑introduction feature is implemented as a lightweight, stateless microservice within the larger AI assistant ecosystem. The architecture follows a pipeline pattern optimized for low latency and high availability.
 
-```
-[Browser/Client] 
-       ↕ HTTPS (REST API)
-[Load Balancer] 
-       ↕ 
-[Web Server / API Gateway] (Nginx, Kong, etc.)
-       ↕ 
-[Auth Service] (Stateless, handles login, token validation, lockout logic)
-       ↕ 
-[User Database] (PostgreSQL, MySQL) – stores hashed passwords, lockout info
-[Redis] (Optional, for token blacklist & rate limiting)
-[Third-party OAuth] (Future: plugin)
-```
+**Components:**
 
-**Key principles:**
-- All authentication is JWT-based. Tokens are issued, validated, and optionally revoked.
-- Forget password is a separate flow (only entry point defined here).
-- CAPTCHA service (e.g., reCAPTCHA) integrated after 3 consecutive failures.
-- Lockout data stored in the user database (or Redis for TTL).
-- Frontend stores JWT in `httpOnly` cookie for security (`SameSite=Strict`), or in localStorage with careful CSRF protection. We recommend **httpOnly + Secure cookie** to mitigate XSS.
+- **Intent Detector** – Identifies whether the user input is a self‑introduction request (e.g., “请你介绍一下你自己”) or a follow‑up request (e.g., “tell me more”). Supports both keyword matching and, optionally, a lightweight ML classifier for extensibility.
+- **Language Detector** – Determines the language of the user input. Uses a fast heuristic (character Unicode ranges) for Chinese/English, with fallback to a library like `langdetect` for other supported languages.
+- **Introduction Service** – Core logic: loads the appropriate content template from a configuration file, renders it (e.g., inserts the system name), enforces the 100‑word limit, and returns the response. Caches configuration to avoid repeated disk I/O.
+- **Follow‑up Handler** – If the user shows further interest, returns additional details (e.g., a link to a help page) as defined in the configuration.
+- **Response Pipeline** – Ensures friendly, professional tone by applying a deterministic template with no randomness.
 
-**Security measures:**
-- HTTPS enforced (HSTS header).
-- Password hashed with bcrypt (cost factor 12).
-- JWT signed with RS256 (asymmetric) for easy key rotation.
-- CSRF token if using cookie-based token transport.
-- Rate limiting per IP and per username at API gateway.
+**Data Flow:**
+
+1. User sends message to the chat interface.
+2. HTTP request reaches the Introduction Service endpoint.
+3. Intent Detector classifies the message.
+4. If intro request → Language Detector processes the input.
+5. Introduction Service loads the configuration for that language, renders the template.
+6. Response is returned as JSON.
+
+The service is deployed behind a load balancer with at least two instances to achieve 99.9% availability. Caching (e.g., Redis) can be added for the configuration, but in‑memory caching suffices given the small footprint.
+
+---
 
 ### 2. File Structure
 
-**Frontend (React/Vue – example React)**
-
 ```
-frontend/
-├── public/
-├── src/
-│   ├── components/
-│   │   ├── LoginForm.jsx
-│   │   ├── PasswordInput.jsx
-│   │   └── CaptchaWidget.jsx
-│   ├── pages/
-│   │   └── LoginPage.jsx
-│   ├── services/
-│   │   └── authApi.js          (API calls)
-│   ├── hooks/
-│   │   └── useAuth.js          (context/auth state)
-│   ├── utils/
-│   │   └── storage.js          (cookie/token helpers)
-│   ├── App.js
-│   └── index.js
-└── package.json
-```
-
-**Backend (Node.js/Express example)**
-
-```
-backend/
-├── src/
-│   ├── auth/
-│   │   ├── auth.controller.js
-│   │   ├── auth.service.js
-│   │   ├── auth.validation.js
-│   │   └── auth.middleware.js
-│   ├── user/
-│   │   ├── user.model.js
-│   │   ├── user.service.js
-│   │   └── user.validation.js
-│   ├── common/
-│   │   ├── errors.js
-│   │   ├── logger.js
-│   │   ├── rateLimiter.js
-│   │   └── captcha.js
-│   ├── config/
-│   │   └── index.js
-│   ├── routes/
-│   │   └── auth.routes.js
-│   └── app.js
-├── migrations/
+self-intro-service/
+├── main.py                          # Entry point (Flask/FastAPI app)
+├── config/
+│   ├── introduction_zh.yaml         # Chinese introduction template
+│   ├── introduction_en.yaml         # English introduction template
+│   └── introduction_fr.yaml         # French example (extensible)
+├── handlers/
+│   ├── introduction_handler.py      # Core logic for intro generation
+│   └── follow_up_handler.py         # Handles "tell me more" requests
+├── services/
+│   ├── intent_detector.py           # Classifies user input intent
+│   └── language_detector.py         # Detects user language
 ├── tests/
-└── package.json
+│   ├── test_introduction.py
+│   └── test_intent_detector.py
+├── requirements.txt                 # Dependencies
+└── Dockerfile                       # Container definition
 ```
 
-**Database migrations** (e.g., Knex or Prisma)
+**YAML Configuration Example (introduction_en.yaml):**
+```yaml
+name: "ChatBot"
+capabilities: "I can help with language understanding, answering questions, and task assistance."
+limitations: "I cannot access real-time data or the internet."
+tone: "friendly and professional"
+max_words: 100
+follow_up:
+  prompt: "Would you like to know more about my features?"
+  details_url: "/help"
+```
 
-```
-migrations/
-└── 001_create_users.sql
-```
+The template is rendered by replacing placeholders (e.g., `{name}`, `{capabilities}`, `{limitations}`) with the values from the YAML. The final string is automatically word‑counted and truncated if necessary.
 
-User table:
-```sql
-CREATE TABLE users (
-  id SERIAL PRIMARY KEY,
-  username VARCHAR(50) UNIQUE NOT NULL,
-  email VARCHAR(255) UNIQUE,
-  phone VARCHAR(20) UNIQUE,
-  password_hash VARCHAR(255) NOT NULL,
-  failed_attempts INT DEFAULT 0,
-  locked_until TIMESTAMP NULL,
-  created_at TIMESTAMP DEFAULT NOW(),
-  updated_at TIMESTAMP DEFAULT NOW()
-);
-```
+---
 
 ### 3. API Design
 
-All endpoints are prefixed with `/api/v1/auth`.
+**Endpoint:** `POST /api/introduction`
 
-| Method | Endpoint | Description | Request Body | Response |
-|--------|----------|-------------|--------------|----------|
-| POST | `/login` | Authenticate user | `{ login: string (username/email/phone), password: string, captcha?: string, rememberMe?: boolean }` | 200: `{ accessToken, refreshToken?, user: { id, username, email, avatar } }`<br>401: error message |
-| POST | `/refresh` | Refresh access token (optional) | `{ refreshToken: string }` | 200: `{ accessToken, refreshToken? }` |
-| POST | `/logout` | Invalidate current token | `{ token?: string }` (or from cookie) | 200: success |
-| GET | `/user` | Get current user info | – | 200: user object |
-| GET | `/captcha` | Get captcha challenge (if needed) | – | 200: challenge data (e.g., reCAPTCHA site key) |
-| POST | `/password-reset-request` | Initiate password reset (separate flow) | `{ email, phone }` | 200: success |
-
-**Error responses** (uniform):
+**Request Body:**
 ```json
 {
-  "error": {
-    "code": "INVALID_CREDENTIALS",
-    "message": "Username or password is incorrect"
-  }
+  "message": "请你介绍一下你自己"
 }
 ```
 
-**Authentication header**: `Authorization: Bearer <accessToken>`
+**Response (200 OK):**
+```json
+{
+  "response": "你好！我是ChatBot，一个AI助手。我可以帮助你理解语言、回答问题以及完成各种任务。请注意，我无法访问实时数据或互联网。",
+  "language": "zh",
+  "follow_up_prompt": "你想了解更多关于我的功能吗？"
+}
+```
 
-**Token expiry settings:**
-- Access token: 15 minutes (short-lived)
-- Refresh token (if used with `rememberMe`): 7 days; without rememberMe: session-only (no refresh token stored)
-- Alternatively, use a single token with long expiry based on `rememberMe` – simpler but less secure. We'll use **single long-lived token** with `rememberMe` flag encoded inside.
+**Error Responses:**
+- `400 Bad Request` – Missing or empty `message` field.
+- `500 Internal Server Error` – Configuration load failure.
+
+**Design Notes:**
+- The endpoint is stateless – no session or authentication required for this single feature.
+- Response time is measured from receipt of request to sending the response; the handler must complete within 500ms to allow for network latency.
+- For follow‑up requests, the same endpoint is used; the **Intent Detector** differentiates between an initial introduction and a follow‑up by matching keywords like “更多” / “more” / “tell me more”.
+
+---
 
 ### 4. Key Implementation Notes
 
-#### 4.1 Login Flow (high-level pseudocode)
+#### 4.1 Intent Detection
+- **Primary method:** Keyword‑based matching against a set of phrases (e.g., “介绍”, “你是谁”, “introduce yourself”). This is extremely fast (<1ms).
+- **Secondary method (optional):** Use a small regex or a pre‑trained text classifier (e.g., fastText) for better generalization. The model would be loaded once at startup.
+- **Follow‑up detection:** After an introduction, if the user sends a message containing “更多”, “more”, “details”, the system returns the `follow_up` content from the config.
 
-```
-POST /login:
-1. Validate input (login, password, captcha if present)
-2. Check rate limit by IP & username (if >3 failed attempts: require captcha)
-3. Find user by login (search username, email, phone)
-4. If user not found => return 401 "Invalid credentials"
-5. If user.locked_until > now => return 429 "Account locked for X minutes"
-6. Verify password with bcrypt
-7. If password failed:
-   a. Increment failed_attempts
-   b. If failed_attempts >= 5 => set locked_until = now + 15 min
-   c. Return 401 "Invalid credentials"
-8. If password ok:
-   a. Reset failed_attempts = 0, locked_until = null
-   b. Generate JWT:
-      - Payload: userId, username, role, rememberMe (boolean), iat, exp
-      - Sign with RS256 private key
-   c. Set expiry: if rememberMe => 7 days, else => session (e.g., 1 day)
-   d. Return token & user info
-   e. Optionally log audit trail
-```
+#### 4.2 Language Detection
+- **Chinese detection:** Check if the input contains any CJK Unified Ideographs (U+4E00–U+9FFF). If yes, treat as Chinese.
+- **English detection:** Otherwise, default to English. For other languages, use `langdetect` library with a timeout (500ms max). The result is cached per request.
+- To meet the 2‑second end‑to‑end SLA, language detection must complete within 100ms.
 
-#### 4.2 Token Storage & CSRF
+#### 4.3 Configuration Management
+- Config files are loaded into memory at service startup. Any update to a config file triggers a graceful reload via a `SIGHUP` signal or a periodic check (every 60 seconds) without user‑visible downtime.
+- The configuration contains the exact text for capabilities and limitations, ensuring consistency across sessions. No dynamic generation is used.
 
-- **Recommended**: Store JWT in a **httpOnly, Secure, SameSite=Strict** cookie. This prevents XSS theft and provides CSRF protection.
-- **Alternative**: Store in memory + refresh token in httpOnly cookie.
-- If using cookie, an additional CSRF token (double-submit cookie pattern) is unnecessary with SameSite=Strict, but ensure all dashboard forms include a anti-CSRF token for protected actions.
+#### 4.4 Word Count & Tone
+- The handler counts words using a simple tokenizer (split on spaces for English, character count for Chinese). If the rendered text exceeds 100 words, it truncates at the last full sentence before the limit.
+- Tone is enforced by the template itself – every intro begins with a greeting, states the name, lists capabilities, then limitations, and ends with a positive offer. No slang or overly casual language is allowed.
 
-#### 4.3 Multi-device Policy
+#### 4.5 Performance & Availability
+- **Caching:** Config is held in a Python dictionary; no external cache is required for a single instance. For multi‑instance deployments, a shared Redis can keep configs in sync.
+- **Response time budget:** intent detection (5ms) + language detection (50ms) + config load (1ms, cached) + template rendering (5ms) = ~61ms. The rest of the 2‑second SLA is allocated to network and queueing.
+- **Availability:** Deploy at least two instances behind a load balancer with health checks. Use a container orchestrator (Kubernetes) that restarts failed containers automatically.
 
-- **Single sign-on**: On login, blacklist any existing valid tokens for that user (store user's token version in DB or Redis). Invalidate by incrementing a `token_version` column. JWT includes `version` claim; if version does not match, reject.
-- **Multiple sessions allowed**: No special handling (default). Each login creates a new token. Server-side may track active sessions.
+#### 4.6 Testing & Verification
+- **AC-01:** Use an automated script that sends “请你介绍一下你自己” and measures round‑trip time with a stopwatch. Log response times to a monitoring system.
+- **AC-02:** Unit test verifies that the response contains keywords like “AI assistant”, “can help with”, “cannot access real‑time”.
+- **AC-03:** Send inputs in Chinese, English, and French – verify the `language` field in the response matches.
+- **AC-04:** Word‑count check in integration tests.
+- **AC-05:** Human QA reviews the templates once per release.
+- **AC-06:** Run 10 successive identical requests; compare responses programmatically (ignoring timestamps, if any).
+- **AC-07:** Send “tell me more” after an introduction; verify that the follow‑up prompt appears and that the system returns a help link.
 
-#### 4.4 Lockout & CAPTCHA
+#### 4.7 Extensibility
+- Adding a new language requires only: 1) creating a new YAML file (e.g., `introduction_ja.yaml`), 2) adding the language code to the language detector’s supported list, and 3) reloading configuration. No code changes are needed.
+- Changing the introduction text (e.g., updating capabilities) is done by editing the YAML file – the service automatically picks up the change on the next config reload.
 
-- After **3 consecutive failed attempts** (per username), frontend should show CAPTCHA (can be checked via a separate endpoint or via response header).
-- To avoid race conditions, use atomic increment in DB or Redis with expiring keys.
-- Lockout is based on IP + username combination? Requirement says "IP或账号". We'll lock **username** globally to prevent distributed attacks.
+---
 
-#### 4.5 Password Reset Link
-
-- This endpoint is not defined in detail, but we must provide the entry point: `POST /password-reset-request`. The service sends an email/SMS with a time-limited token to reset password. This is a separate feature.
-
-#### 4.6 Logout
-
-- Invalidate token by adding it to a **blacklist** (Redis with TTL matching token expiry) or by clearing the cookie.
-- For better security, maintain a token version or a revocation list.
-
-#### 4.7 Audit Logging
-
-- All login attempts (success/fail) are logged asynchronously to a logging service (e.g., ELK stack) with: timestamp, userId (if identified), IP, user-agent, result.
-- Retention: 180 days.
-
-#### 4.8 Performance & Scalability
-
-- Auth service is stateless (JWT), so scale horizontally.
-- Use Redis for lockout counters and token blacklist to avoid DB load.
-- Rate limiting at API gateway (e.g., Nginx limit_req, Kong rate-limiting plugin).
-- For 1000 concurrent login requests, each request should be under 2s (mostly DB lookup + bcrypt). Bcrypt cost factor should be tuned (10–12). Optionally use async worker threads for password hashing.
-
-#### 4.9 Frontend Implementation Notes
-
-- Use a state management (Redux, Context) to hold auth state.
-- On login success, store token in cookie and redirect.
-- On 401 response, redirect to login page (or show a modal).
-- For "remember me", send boolean in request; backend sets appropriate expiry.
-- Password visibility toggle: local state only, no server impact.
-- Client-side validation: required fields, min password length.
-- After 3 failed attempts, fetch a captcha challenge and show widget.
-
-#### 4.10 Testing Considerations
-
-- Unit tests for auth service (password validation, lockout, token generation).
-- Integration tests for API endpoints with mocked DB.
-- Security tests: OWASP scan, brute force simulation, CSRF checks.
-- Performance load test with 1000 concurrent logins.
-
-This solution meets all functional and non-functional requirements while remaining extensible for third-party OAuth (via plugin pattern) and future enhancements.
+*This design satisfies all functional and non‑functional requirements while keeping the implementation simple, testable, and maintainable.*

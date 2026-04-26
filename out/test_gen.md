@@ -1,472 +1,396 @@
-We'll generate a comprehensive test suite using `pytest` for the described user login system. The tests cover both unit-level logic (auth service) and integration-level API endpoints, with mocking for external dependencies (database, Redis, token blacklist, captcha verification).
-
-## Test Files Overview
-
-- **`tests/unit/test_auth_service.py`**: Unit tests for `auth.service.py` functions: password verification, lockout logic, JWT generation/validation, captcha requirement after failures.
-- **`tests/integration/test_auth_api.py`**: Integration tests for `POST /api/v1/auth/login`, `POST /refresh`, `POST /logout`, `GET /user`, etc., using an in-memory database and mocked external services.
-
-We assume a Python backend using Flask/FastAPI, with `bcrypt`, `PyJWT`, and an ORM (e.g., SQLAlchemy). Tests are structured to be run with `pytest`.
+Below are the pytest unit and integration tests covering the self‑introduction service as described. They verify each component (intent detection, language detection, introduction rendering, follow‑up handling) and the full `/api/introduction` endpoint, including edge cases and error conditions.
 
 ---
 
-## `tests/unit/test_auth_service.py`
-
 ```python
+# tests/conftest.py
 import pytest
-from datetime import datetime, timedelta
-from unittest.mock import Mock, patch, MagicMock
-import bcrypt
-import jwt
-from auth.auth_service import AuthService
-from auth.user_model import User
-from common.errors import InvalidCredentials, AccountLocked, CaptchaRequired
+from unittest.mock import Mock, patch
+import yaml
+from fastapi.testclient import TestClient
+from main import app  # assume FastAPI app in main.py
 
-class TestAuthService:
-    """Unit tests for AuthService methods."""
+# Sample configs for testing
+SAMPLE_CONFIG_EN = {
+    "name": "ChatBot",
+    "capabilities": "I can help with language understanding, answering questions, and task assistance.",
+    "limitations": "I cannot access real-time data or the internet.",
+    "tone": "friendly and professional",
+    "max_words": 100,
+    "follow_up": {
+        "prompt": "Would you like to know more about my features?",
+        "details_url": "/help"
+    }
+}
 
-    @pytest.fixture
-    def auth_service(self):
-        """Create an AuthService instance with mocked dependencies."""
-        config = {
-            'JWT_SECRET': 'test_secret',
-            'JWT_ALGORITHM': 'HS256',
-            'ACCESS_TOKEN_EXPIRE_MINUTES': 15,
-            'REFRESH_TOKEN_EXPIRE_DAYS': 7,
-            'BCRYPT_COST': 12,
-            'MAX_FAILED_ATTEMPTS': 5,
-            'LOCKOUT_DURATION_MINUTES': 15,
-            'CAPTCHA_ATTEMPT_THRESHOLD': 3,
-            'CAPTCHA_ENABLED': True
-        }
-        # Mock database session and redis
-        db = MagicMock()
-        redis = MagicMock()
-        return AuthService(config, db, redis)
+SAMPLE_CONFIG_ZH = {
+    "name": "ChatBot",
+    "capabilities": "我可以帮助你理解语言、回答问题以及完成各种任务。",
+    "limitations": "我无法访问实时数据或互联网。",
+    "tone": "友好且专业",
+    "max_words": 100,
+    "follow_up": {
+        "prompt": "你想了解更多关于我的功能吗？",
+        "details_url": "/help"
+    }
+}
 
-    # ------------- Password Verification -------------
-    def test_verify_password_correct(self, auth_service):
-        password = "StrongPass123!"
-        hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-        assert auth_service.verify_password(password, hashed) is True
+SAMPLE_CONFIG_FR = {
+    "name": "ChatBot",
+    "capabilities": "Je peux vous aider à comprendre le langage, répondre aux questions et effectuer des tâches.",
+    "limitations": "Je ne peux pas accéder aux données en temps réel ni à Internet.",
+    "tone": "amical et professionnel",
+    "max_words": 100,
+    "follow_up": {
+        "prompt": "Souhaitez-vous en savoir plus sur mes fonctionnalités?",
+        "details_url": "/aide"
+    }
+}
 
-    def test_verify_password_incorrect(self, auth_service):
-        hashed = bcrypt.hashpw(b"wrong_hash", bcrypt.gensalt())
-        assert auth_service.verify_password("RealPass", hashed) is False
+@pytest.fixture
+def client():
+    """FastAPI test client."""
+    return TestClient(app)
 
-    # ------------- User Lookup -------------
-    def test_find_user_by_username(self, auth_service):
-        mock_user = Mock(spec=User, username="john_doe")
-        auth_service.db.query.return_value.filter.return_value.first.return_value = mock_user
-        user = auth_service.find_user_by_login("john_doe")
-        assert user == mock_user
-        # Verify query was called with username filter
-        auth_service.db.query.assert_called_with(User)
+@pytest.fixture
+def mock_config_loader():
+    """Mock loading of YAML configs."""
+    def _mock_load(language):
+        configs = {"en": SAMPLE_CONFIG_EN, "zh": SAMPLE_CONFIG_ZH, "fr": SAMPLE_CONFIG_FR}
+        return configs.get(language, None)
+    return _mock_load
 
-    def test_find_user_by_email(self, auth_service):
-        mock_user = Mock(spec=User, email="john@example.com")
-        auth_service.db.query.return_value.filter.return_value.first.return_value = mock_user
-        user = auth_service.find_user_by_login("john@example.com")
-        assert user == mock_user
+@pytest.fixture
+def mock_intent_detector():
+    """Fixture to mock intent detector."""
+    with patch("services.intent_detector.IntentDetector") as mock:
+        detector = mock.return_value
+        # Default: classify as initial intro
+        detector.classify.return_value = "initial_intro"
+        yield detector
 
-    def test_find_user_not_found(self, auth_service):
-        auth_service.db.query.return_value.filter.return_value.first.return_value = None
-        user = auth_service.find_user_by_login("nonexistent")
-        assert user is None
-
-    # ------------- Lockout Logic -------------
-    def test_is_account_locked_no_lock(self, auth_service):
-        mock_user = Mock(locked_until=None)
-        assert auth_service.is_account_locked(mock_user) is False
-
-    def test_is_account_locked_future_time(self, auth_service):
-        future = datetime.utcnow() + timedelta(minutes=10)
-        mock_user = Mock(locked_until=future)
-        assert auth_service.is_account_locked(mock_user) is True
-
-    def test_is_account_locked_past_time(self, auth_service):
-        past = datetime.utcnow() - timedelta(minutes=10)
-        mock_user = Mock(locked_until=past)
-        assert auth_service.is_account_locked(mock_user) is False
-
-    def test_lock_account_reaches_threshold(self, auth_service):
-        # After 5 failed attempts, should lock
-        mock_user = Mock(failed_attempts=4, locked_until=None)
-        result = auth_service.handle_failed_login(mock_user)
-        assert mock_user.failed_attempts == 5
-        assert mock_user.locked_until is not None
-        assert result['action'] == 'locked'
-
-    def test_lock_account_not_reached(self, auth_service):
-        mock_user = Mock(failed_attempts=2, locked_until=None)
-        result = auth_service.handle_failed_login(mock_user)
-        assert mock_user.failed_attempts == 3
-        assert mock_user.locked_until is None
-        assert result['action'] == 'increment'
-
-    # ------------- Captcha Requirement -------------
-    def test_captcha_required_after_3_failures(self, auth_service):
-        mock_user = Mock(failed_attempts=2, locked_until=None)
-        assert auth_service.is_captcha_required(mock_user) is True
-
-    def test_captcha_not_required_below_threshold(self, auth_service):
-        mock_user = Mock(failed_attempts=0, locked_until=None)
-        assert auth_service.is_captcha_required(mock_user) is False
-
-    def test_captcha_not_required_when_captcha_disabled(self, auth_service):
-        auth_service.config['CAPTCHA_ENABLED'] = False
-        mock_user = Mock(failed_attempts=10)
-        assert auth_service.is_captcha_required(mock_user) is False
-
-    # ------------- JWT Generation -------------
-    def test_generate_access_token_with_remember_me(self, auth_service):
-        token = auth_service.generate_token(user_id=1, username="test", remember_me=True)
-        payload = jwt.decode(token, auth_service.config['JWT_SECRET'], algorithms=[auth_service.config['JWT_ALGORITHM']])
-        assert payload['remember_me'] is True
-        # Check expiry: should be 7 days
-        exp = datetime.utcfromtimestamp(payload['exp'])
-        assert (exp - datetime.utcnow()).days == 7
-
-    def test_generate_access_token_without_remember_me(self, auth_service):
-        token = auth_service.generate_token(user_id=1, username="test", remember_me=False)
-        payload = jwt.decode(token, auth_service.config['JWT_SECRET'], algorithms=[auth_service.config['JWT_ALGORITHM']])
-        assert payload['remember_me'] is False
-        # Check expiry: should be 15 minutes (configured)
-        exp = datetime.utcfromtimestamp(payload['exp'])
-        delta = exp - datetime.utcnow()
-        assert delta.total_seconds() // 60 == 15
-
-    # ------------- Token Blacklisting (Logout) -------------
-    def test_blacklist_token(self, auth_service):
-        token = "some_token"
-        auth_service.blacklist_token(token, ttl=3600)
-        auth_service.redis.setex.assert_called_once_with(f"blacklist:{token}", 3600, True)
-
-    def test_is_token_blacklisted_true(self, auth_service):
-        auth_service.redis.get.return_value = b'1'
-        assert auth_service.is_token_blacklisted("blacklisted_token") is True
-
-    def test_is_token_blacklisted_false(self, auth_service):
-        auth_service.redis.get.return_value = None
-        assert auth_service.is_token_blacklisted("valid_token") is False
-
-    # ------------- Full Login Flow (unit test with mock user) -------------
-    def test_login_successful(self, auth_service):
-        # Mock user with no lockout and correct password
-        mock_user = Mock(
-            id=1,
-            username="john_doe",
-            email="john@example.com",
-            password_hash=bcrypt.hashpw(b"CorrectPassword", bcrypt.gensalt()),
-            failed_attempts=0,
-            locked_until=None,
-            token_version=1
-        )
-        auth_service.find_user_by_login = Mock(return_value=mock_user)
-        auth_service.is_account_locked = Mock(return_value=False)
-        auth_service.verify_password = Mock(return_value=True)
-        auth_service.generate_token = Mock(return_value="access_token")
-
-        result = auth_service.login("john_doe", "CorrectPassword")
-        assert result['access_token'] == "access_token"
-        assert result['user']['id'] == 1
-        assert mock_user.failed_attempts == 0  # reset
-        assert mock_user.locked_until is None
-
-    def test_login_incorrect_password(self, auth_service):
-        mock_user = Mock(
-            id=1,
-            username="john_doe",
-            password_hash=b'$2b$12$...',
-            failed_attempts=0,
-            locked_until=None
-        )
-        auth_service.find_user_by_login = Mock(return_value=mock_user)
-        auth_service.is_account_locked = Mock(return_value=False)
-        auth_service.verify_password = Mock(return_value=False)
-        auth_service.is_captcha_required = Mock(return_value=False)
-
-        with pytest.raises(InvalidCredentials):
-            auth_service.login("john_doe", "WrongPassword")
-        assert mock_user.failed_attempts == 1
-
-    def test_login_account_locked(self, auth_service):
-        mock_user = Mock(locked_until=datetime.utcnow() + timedelta(minutes=10))
-        auth_service.find_user_by_login = Mock(return_value=mock_user)
-        auth_service.is_account_locked = Mock(return_value=True)
-
-        with pytest.raises(AccountLocked):
-            auth_service.login("john_doe", "anypassword")
-
-    def test_login_captcha_required_but_not_provided(self, auth_service):
-        mock_user = Mock(failed_attempts=2, locked_until=None, password_hash=b'hash')
-        auth_service.find_user_by_login = Mock(return_value=mock_user)
-        auth_service.is_account_locked = Mock(return_value=False)
-        # Simulate that captcha is needed but not sent
-        auth_service.is_captcha_required = Mock(return_value=True)
-
-        with pytest.raises(CaptchaRequired):
-            auth_service.login("john_doe", "anypassword", captcha=None)
-
-    def test_login_captcha_valid(self, auth_service):
-        mock_user = Mock(
-            id=1,
-            username="john_doe",
-            password_hash=bcrypt.hashpw(b"CorrectPassword", bcrypt.gensalt()),
-            failed_attempts=2,
-            locked_until=None,
-            token_version=1
-        )
-        auth_service.find_user_by_login = Mock(return_value=mock_user)
-        auth_service.is_account_locked = Mock(return_value=False)
-        auth_service.verify_password = Mock(return_value=True)
-        auth_service.generate_token = Mock(return_value="access_token")
-        auth_service.is_captcha_required = Mock(return_value=True)
-        auth_service.verify_captcha = Mock(return_value=True)
-
-        result = auth_service.login("john_doe", "CorrectPassword", captcha="valid_token")
-        assert result['access_token'] == "access_token"
-
-    def test_login_captcha_invalid(self, auth_service):
-        mock_user = Mock(failed_attempts=2, locked_until=None)
-        auth_service.find_user_by_login = Mock(return_value=mock_user)
-        auth_service.is_account_locked = Mock(return_value=False)
-        auth_service.is_captcha_required = Mock(return_value=True)
-        auth_service.verify_captcha = Mock(return_value=False)
-
-        with pytest.raises(InvalidCredentials):
-            auth_service.login("john_doe", "anypassword", captcha="wrong")
-
-    # ------------- Token Refresh -------------
-    def test_refresh_token_valid(self, auth_service):
-        # Assume refresh token is a special token that we can validate
-        auth_service.validate_refresh_token = Mock(return_value={'user_id': 1, 'username': 'test'})
-        auth_service.generate_token = Mock(return_value="new_access_token")
-        result = auth_service.refresh("valid_refresh_token")
-        assert result['access_token'] == "new_access_token"
-
-    def test_refresh_token_invalid(self, auth_service):
-        auth_service.validate_refresh_token = Mock(side_effect=jwt.InvalidTokenError)
-        with pytest.raises(InvalidCredentials):
-            auth_service.refresh("invalid_refresh_token")
-
-    # ------------- Multi-device (Token Version) -------------
-    def test_token_version_mismatch(self, auth_service):
-        mock_user = Mock(token_version=2)
-        # Create a token with version=1
-        payload = {'user_id': 1, 'version': 1}
-        token = jwt.encode(payload, auth_service.config['JWT_SECRET'], algorithm='HS256')
-        # In service, verify_token checks version against DB
-        auth_service.verify_token_version(token, mock_user)
-        # Assert that if versions differ, token is considered invalid
-        with pytest.raises(InvalidCredentials):
-            auth_service.verify_token(token)  # This should check version
-
-    def test_token_version_match(self, auth_service):
-        mock_user = Mock(token_version=1)
-        payload = {'user_id': 1, 'version': 1}
-        token = jwt.encode(payload, auth_service.config['JWT_SECRET'], algorithm='HS256')
-        # Should not raise
-        auth_service.verify_token_version(token, mock_user)
+@pytest.fixture
+def mock_language_detector():
+    """Fixture to mock language detector."""
+    with patch("services.language_detector.LanguageDetector") as mock:
+        detector = mock.return_value
+        detector.detect.return_value = "en"
+        yield detector
 ```
 
 ---
 
-## `tests/integration/test_auth_api.py`
+```python
+# tests/test_intent_detector.py
+import pytest
+from unittest.mock import patch
+from services.intent_detector import IntentDetector
+
+# We assume IntentDetector has a method classify(message) -> str
+# Possible returns: "initial_intro", "follow_up", "other"
+
+@pytest.mark.unit
+class TestIntentDetector:
+    """Unit tests for IntentDetector."""
+
+    def setup_method(self):
+        self.detector = IntentDetector()
+
+    @patch("services.intent_detector.load_keywords")
+    def test_initial_intro_chinese(self, mock_keywords):
+        """AC-07: Chinese 'introduce yourself' triggers initial_intro."""
+        mock_keywords.return_value = {"initial": ["介绍", "你是谁", "自我介绍"]}
+        result = self.detector.classify("请你介绍一下你自己")
+        assert result == "initial_intro"
+
+    @patch("services.intent_detector.load_keywords")
+    def test_follow_up_english(self, mock_keywords):
+        """AC-07: 'tell me more' triggers follow_up."""
+        mock_keywords.return_value = {"follow_up": ["more", "tell me more", "details"]}
+        result = self.detector.classify("tell me more")
+        assert result == "follow_up"
+
+    @patch("services.intent_detector.load_keywords")
+    def test_non_intro_message(self, mock_keywords):
+        """Random message triggers 'other'."""
+        mock_keywords.return_value = {"initial": ["介绍"], "follow_up": ["more"]}
+        result = self.detector.classify("What is the weather?")
+        assert result == "other"
+
+    @patch("services.intent_detector.load_keywords")
+    def test_empty_message(self, mock_keywords):
+        """Empty message returns 'other' (not an error)."""
+        mock_keywords.return_value = {"initial": [], "follow_up": []}
+        result = self.detector.classify("")
+        assert result == "other"
+```
+
+---
 
 ```python
+# tests/test_language_detector.py
 import pytest
-import json
-from flask import Flask
-from flask.testing import FlaskClient
+from services.language_detector import LanguageDetector
+
+# Assume detect(message) -> str (language code)
+
+@pytest.mark.unit
+class TestLanguageDetector:
+    """Unit tests for LanguageDetector."""
+
+    def setup_method(self):
+        self.detector = LanguageDetector()
+
+    def test_detect_chinese(self):
+        """CJK characters → 'zh'."""
+        result = self.detector.detect("请你介绍一下你自己")
+        assert result == "zh"
+
+    def test_detect_english(self):
+        """ASCII without CJK → 'en'."""
+        result = self.detector.detect("Please introduce yourself")
+        assert result == "en"
+
+    def test_detect_french(self):
+        """French text (Latin with accents) → 'fr' using langdetect fallback."""
+        # Assume langdetect works; we can simulate with a mock if needed
+        result = self.detector.detect("Présentez-vous, s'il vous plaît")
+        assert result == "fr"
+
+    def test_detect_empty_message(self):
+        """Empty string → default 'en'."""
+        result = self.detector.detect("")
+        assert result == "en"
+
+    def test_detect_mixed_languages(self):
+        """Mixed Chinese and English → prefer Chinese (first CJK)."""
+        result = self.detector.detect("Hello 世界")
+        assert result == "zh"
+```
+
+---
+
+```python
+# tests/test_introduction_handler.py
+import pytest
 from unittest.mock import patch, MagicMock
-from datetime import datetime, timedelta
+from handlers.introduction_handler import IntroductionHandler
+from config.loader import ConfigLoader  # assume exists
 
-from app import create_app  # Assuming application factory
-from config import TestConfig
+@pytest.mark.unit
+class TestIntroductionHandler:
+    """Unit tests for IntroductionHandler (intro rendering)."""
 
-@pytest.fixture
-def app():
-    app = create_app(TestConfig)
-    with app.app_context():
-        # Setup database (e.g., in-memory SQLite)
-        from models import db
-        db.create_all()
-        yield app
-        db.drop_all()
+    def setup_method(self):
+        self.handler = IntroductionHandler()
 
-@pytest.fixture
-def client(app):
-    return app.test_client()
+    @patch.object(ConfigLoader, "get_config")
+    def test_render_introduction_english(self, mock_get_config):
+        """Verify template placeholders are replaced correctly."""
+        config = {
+            "name": "ChatBot",
+            "capabilities": "I can help with language understanding.",
+            "limitations": "I cannot access real-time data.",
+            "max_words": 100,
+            "follow_up": {}
+        }
+        mock_get_config.return_value = config
+        rendered = self.handler.render_introduction("en")
+        expected = "I am ChatBot, an AI assistant. I can help with language understanding. Please note, I cannot access real-time data."
+        assert rendered == expected
 
-# Helper to create a user in test DB
-def create_user(db_session, username="testuser", email="test@example.com", password="TestPass123!"):
-    from models import User
-    import bcrypt
-    hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
-    user = User(username=username, email=email, password_hash=hashed)
-    db_session.add(user)
-    db_session.commit()
-    return user
+    @patch.object(ConfigLoader, "get_config")
+    def test_word_count_truncation(self, mock_get_config):
+        """Words > max_words should be truncated to last complete sentence under limit."""
+        config = {
+            "name": "ChatBot",
+            "capabilities": "A " * 50,   # 50 words
+            "limitations": "B " * 60,   # 60 words
+            "max_words": 100,           # total would be >100
+            "follow_up": {}
+        }
+        mock_get_config.return_value = config
+        rendered = self.handler.render_introduction("en")
+        word_count = len(rendered.split())
+        assert word_count <= 100
+        # Ensure it ends with a period (complete sentence)
+        assert rendered.rstrip().endswith(".")
+        # Verify it contains the beginning of the capabilities
+        assert "A" in rendered
 
-class TestLoginEndpoint:
-    """Integration tests for POST /api/v1/auth/login"""
+    @patch.object(ConfigLoader, "get_config")
+    def test_word_count_within_limit(self, mock_get_config):
+        """Short text stays unchanged."""
+        config = {
+            "name": "Bot",
+            "capabilities": "Short.",
+            "limitations": "None.",
+            "max_words": 100,
+            "follow_up": {}
+        }
+        mock_get_config.return_value = config
+        rendered = self.handler.render_introduction("en")
+        assert len(rendered.split()) <= 100
+        assert "Short." in rendered
 
-    def test_login_successful(self, client, db_session):
-        user = create_user(db_session, username="johndoe", password="CorrectP@ss1")
-        response = client.post("/api/v1/auth/login", 
-                               json={"login": "johndoe", "password": "CorrectP@ss1"})
-        assert response.status_code == 200
-        data = response.get_json()
-        assert "access_token" in data
-        assert "user" in data
-        assert data["user"]["username"] == "johndoe"
-        # Check that user's failed_attempts reset to 0
-        db_session.refresh(user)
-        assert user.failed_attempts == 0
-        assert user.locked_until is None
-
-    def test_login_wrong_password(self, client, db_session):
-        user = create_user(db_session, username="johndoe", password="CorrectP@ss1")
-        response = client.post("/api/v1/auth/login",
-                               json={"login": "johndoe", "password": "WrongP@ss"})
-        assert response.status_code == 401
-        data = response.get_json()
-        assert "error" in data
-        assert data["error"]["code"] == "INVALID_CREDENTIALS"
-        # Check failed_attempts incremented
-        db_session.refresh(user)
-        assert user.failed_attempts == 1
-
-    def test_login_user_not_found(self, client):
-        response = client.post("/api/v1/auth/login",
-                               json={"login": "nonexistent", "password": "any"})
-        assert response.status_code == 401
-        # Should not disclose that user doesn't exist; same generic error
-        data = response.get_json()
-        assert data["error"]["code"] == "INVALID_CREDENTIALS"
-
-    def test_login_account_locked(self, client, db_session):
-        # Create user with lockout
-        from models import User
-        user = create_user(db_session, username="lockeduser")
-        user.locked_until = datetime.utcnow() + timedelta(minutes=15)
-        db_session.commit()
-        response = client.post("/api/v1/auth/login",
-                               json={"login": "lockeduser", "password": "any"})
-        assert response.status_code == 429
-        data = response.get_json()
-        assert "Account locked" in data["error"]["message"]
-
-    def test_login_with_remember_me(self, client, db_session):
-        create_user(db_session, username="rememberme", password="Pass123!")
-        response = client.post("/api/v1/auth/login",
-                               json={"login": "rememberme", "password": "Pass123!", "rememberMe": True})
-        assert response.status_code == 200
-        data = response.get_json()
-        token = data["access_token"]
-        # Decode to verify remember_me claim (if using JWT)
-        import jwt
-        payload = jwt.decode(token, options={"verify_signature": False})
-        assert payload["remember_me"] is True
-
-    def test_login_captcha_required_after_3_failures(self, client, db_session):
-        # Create user with 2 failed attempts already
-        user = create_user(db_session, username="captchauser", password="Pass123!")
-        user.failed_attempts = 2
-        db_session.commit()
-        # Third attempt without captcha should require it
-        response = client.post("/api/v1/auth/login",
-                               json={"login": "captchauser", "password": "wrong"})
-        assert response.status_code == 400  # or 401 with captcha required
-        data = response.get_json()
-        # The exact code depends on implementation; assume captcha_required error
-        # We'll check for "CAPTCHA_REQUIRED" error code
-        assert data["error"]["code"] == "CAPTCHA_REQUIRED"
-
-    def test_login_with_valid_captcha(self, client, db_session, mocker):
-        # Mock captcha verification to succeed
-        mocker.patch('services.auth_service.verify_captcha', return_value=True)
-        user = create_user(db_session, username="captchauser2", password="Pass123!")
-        user.failed_attempts = 3
-        db_session.commit()
-        response = client.post("/api/v1/auth/login",
-                               json={"login": "captchauser2", "password": "Pass123!", "captcha": "valid_token"})
-        assert response.status_code == 200
-
-    def test_login_with_invalid_captcha(self, client, db_session, mocker):
-        mocker.patch('services.auth_service.verify_captcha', return_value=False)
-        user = create_user(db_session, username="captchauser3", password="Pass123!")
-        user.failed_attempts = 3
-        db_session.commit()
-        response = client.post("/api/v1/auth/login",
-                               json={"login": "captchauser3", "password": "Pass123!", "captcha": "invalid_token"})
-        assert response.status_code == 401
-
-    def test_login_input_validation_missing_fields(self, client):
-        response = client.post("/api/v1/auth/login", json={"login": "test"})
-        assert response.status_code == 400
-        data = response.get_json()
-        assert "password" in data["error"]["message"]  # validation error
-
-class TestRefreshEndpoint:
-    @pytest.fixture(autouse=True)
-    def setup(self, client, db_session):
-        self.user = create_user(db_session, username="refreshtest", password="Pass123!")
-
-    def test_refresh_successful(self, client, db_session, mocker):
-        # First login to get refresh token (assuming implementation uses refresh tokens)
-        login_resp = client.post("/api/v1/auth/login", 
-                                 json={"login": "refreshtest", "password": "Pass123!"})
-        assert login_resp.status_code == 200
-        login_data = login_resp.get_json()
-        refresh_token = login_data.get("refresh_token")
-        # Mock refresh token validation
-        mocker.patch('services.auth_service.validate_refresh_token', 
-                     return_value={'user_id': self.user.id, 'username': 'refreshtest'})
-        response = client.post("/api/v1/auth/refresh", json={"refreshToken": refresh_token})
-        assert response.status_code == 200
-        data = response.get_json()
-        assert "access_token" in data
-
-    def test_refresh_with_expired_token(self, client, mocker):
-        mocker.patch('services.auth_service.validate_refresh_token', side_effect=jwt.ExpiredSignatureError)
-        response = client.post("/api/v1/auth/refresh", json={"refreshToken": "expired_token"})
-        assert response.status_code == 401
-
-class TestLogoutEndpoint:
-    def test_logout_successful(self, client, mocker):
-        # Mock token blacklisting
-        mocker.patch('services.auth_service.blacklist_token', return_value=None)
-        # Need a valid token in header; we can create one
-        headers = {'Authorization': 'Bearer some_valid_token'}
-        response = client.post("/api/v1/auth/logout", headers=headers)
-        assert response.status_code == 200
-
-class TestUserInfoEndpoint:
-    def test_get_user_info_authenticated(self, client, db_session, mocker):
-        user = create_user(db_session, username="userinfo")
-        # Simulate token validation and user retrieval
-        mocker.patch('auth.middleware.decode_token', return_value={'user_id': user.id})
-        headers = {'Authorization': 'Bearer valid_token'}
-        response = client.get("/api/v1/auth/user", headers=headers)
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["username"] == "userinfo"
-
-    def test_get_user_info_unauthenticated(self, client):
-        response = client.get("/api/v1/auth/user")
-        assert response.status_code == 401
-
-# Note: Additional tests can be added for rate limiting, multi-device token version, etc.
+    @patch.object(ConfigLoader, "get_config")
+    def test_config_loaded_per_language(self, mock_get_config):
+        """Handler calls ConfigLoader with correct language."""
+        mock_get_config.return_value = {}
+        self.handler.render_introduction("fr")
+        mock_get_config.assert_called_with("fr")
 ```
 
 ---
 
-## Running the Tests
+```python
+# tests/test_follow_up_handler.py
+import pytest
+from unittest.mock import patch
+from handlers.follow_up_handler import FollowUpHandler
+from config.loader import ConfigLoader
 
-```bash
-pip install pytest pytest-mock pytest-flask
-pytest tests/ -v
+@pytest.mark.unit
+class TestFollowUpHandler:
+    """Unit tests for FollowUpHandler."""
+
+    def setup_method(self):
+        self.handler = FollowUpHandler()
+
+    @patch.object(ConfigLoader, "get_config")
+    def test_follow_up_returns_prompt_and_url(self, mock_get_config):
+        """Handler returns follow-up object from config."""
+        mock_get_config.return_value = {
+            "follow_up": {
+                "prompt": "Want more?",
+                "details_url": "/help"
+            }
+        }
+        result = self.handler.get_follow_up("en")
+        assert result == {"prompt": "Want more?", "details_url": "/help"}
+
+    @patch.object(ConfigLoader, "get_config")
+    def test_no_follow_up_for_initial_intro(self, mock_get_config):
+        """When intent is initial_intro, follow_up should not be returned."""
+        # In the real handler, this might return None or empty
+        result = self.handler.get_follow_up("en", is_initial=True)
+        assert result is None or result == {}
 ```
 
-These tests cover the core behaviors described in the technical solution, ensuring both correct functionality and error handling. The unit tests verify business logic in isolation, while integration tests confirm that endpoints behave as expected with a realistic (mocked) stack.
+---
+
+```python
+# tests/test_api.py
+import pytest
+from fastapi.testclient import TestClient
+from main import app
+from unittest.mock import patch, MagicMock
+
+@pytest.mark.integration
+class TestIntroductionAPI:
+    """Integration tests for POST /api/introduction."""
+
+    def test_intro_zh(self, client, mock_intent_detector, mock_language_detector, mock_config_loader):
+        """AC-02 & AC-03: Chinese request returns correct response and language."""
+        mock_intent_detector.classify.return_value = "initial_intro"
+        mock_language_detector.detect.return_value = "zh"
+        # Patch the introduction_handler to use mock config
+        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_ZH):
+            response = client.post("/api/introduction", json={"message": "请你介绍一下你自己"})
+            assert response.status_code == 200
+            data = response.json()
+            assert data["language"] == "zh"
+            assert "ChatBot" in data["response"]
+            assert "可以帮助" in data["response"]
+            assert "无法访问" in data["response"]
+
+    def test_intro_en(self, client, mock_intent_detector, mock_language_detector):
+        """AC-02 & AC-03: English request returns correct response and language."""
+        # Reset mocks if needed
+        mock_intent_detector.classify.return_value = "initial_intro"
+        mock_language_detector.detect.return_value = "en"
+        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_EN):
+            response = client.post("/api/introduction", json={"message": "Introduce yourself"})
+            assert response.status_code == 200
+            data = response.json()
+            assert data["language"] == "en"
+            assert "AI assistant" in data["response"]
+            assert "cannot access real-time" in data["response"]
+
+    def test_intro_fr(self, client, mock_intent_detector, mock_language_detector):
+        """AC-03: French request returns French response and language code."""
+        mock_intent_detector.classify.return_value = "initial_intro"
+        mock_language_detector.detect.return_value = "fr"
+        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_FR):
+            response = client.post("/api/introduction", json={"message": "Présentez-vous"})
+            assert response.status_code == 200
+            data = response.json()
+            assert data["language"] == "fr"
+            assert "ChatBot" in data["response"]
+            assert "Je peux" in data["response"]
+
+    def test_follow_up_request(self, client, mock_intent_detector, mock_language_detector):
+        """AC-07: Follow-up request returns follow_up_prompt."""
+        mock_intent_detector.classify.return_value = "follow_up"
+        mock_language_detector.detect.return_value = "en"
+        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_EN):
+            response = client.post("/api/introduction", json={"message": "tell me more"})
+            assert response.status_code == 200
+            data = response.json()
+            assert data["follow_up_prompt"] == SAMPLE_CONFIG_EN["follow_up"]["prompt"]
+            # Optionally check details_url if included in response (spec says it may)
+            # The spec example shows follow_up_prompt, not details_url in response
+
+    def test_empty_message_error(self, client):
+        """Empty message → 400 Bad Request."""
+        response = client.post("/api/introduction", json={"message": ""})
+        assert response.status_code == 400
+        assert "detail" in response.json()  # FastAPI error detail
+
+    def test_missing_message_field(self, client):
+        """Missing 'message' field → 400 Bad Request."""
+        response = client.post("/api/introduction", json={})
+        assert response.status_code == 400
+
+    def test_server_error_on_config_fail(self, client, mock_intent_detector, mock_language_detector):
+        """Config load failure → 500 Internal Server Error."""
+        mock_intent_detector.classify.return_value = "initial_intro"
+        mock_language_detector.detect.return_value = "en"
+        with patch("handlers.introduction_handler.ConfigLoader.get_config", side_effect=FileNotFoundError):
+            response = client.post("/api/introduction", json={"message": "Hi"})
+            assert response.status_code == 500
+
+    def test_word_count_enforcement_integration(self, client, mock_intent_detector, mock_language_detector):
+        """AC-04: Response word count ≤ 100."""
+        # Use a config that would produce a long response
+        long_config = SAMPLE_CONFIG_EN.copy()
+        long_config["capabilities"] = "word " * 200
+        mock_intent_detector.classify.return_value = "initial_intro"
+        mock_language_detector.detect.return_value = "en"
+        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=long_config):
+            response = client.post("/api/introduction", json={"message": "Introduce yourself"})
+            assert response.status_code == 200
+            word_count = len(response.json()["response"].split())
+            assert word_count <= 100
+
+    def test_response_consistency(self, client, mock_intent_detector, mock_language_detector):
+        """AC-06: Ten identical requests return identical responses (ignoring exact whitespace)."""
+        mock_intent_detector.classify.return_value = "initial_intro"
+        mock_language_detector.detect.return_value = "en"
+        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_EN):
+            responses = []
+            for _ in range(10):
+                resp = client.post("/api/introduction", json={"message": "Introduce yourself"})
+                responses.append(resp.json()["response"])
+            # All responses should be identical
+            assert all(r == responses[0] for r in responses)
+```
+
+---
+
+**Notes for the QA team:**
+
+- The tests above assume the existence of modules and classes matching the description (`IntentDetector`, `LanguageDetector`, `IntroductionHandler`, `FollowUpHandler`, `ConfigLoader`, and the FastAPI app in `main.py` with a `POST /api/introduction` endpoint). Adjust imports and patching targets according to the actual implementation.
+- Mocking is used for external dependencies (config loading, keyword lists) to isolate unit tests.
+- The integration tests use a `TestClient` and patches to simulate a full request/response lifecycle, verifying correctness, error handling, performance constraints (word count), and consistency.
+- To run the tests, place them inside the `tests/` directory as shown in the file structure and execute `pytest tests/` from the project root.
