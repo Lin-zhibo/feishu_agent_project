@@ -11,3 +11,4 @@ config/model.json
 doc/NOTE.md
 log
 util
+*/.*

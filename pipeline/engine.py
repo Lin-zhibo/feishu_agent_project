@@ -13,6 +13,7 @@ from pathlib import Path
 
 from langchain.chains import SequentialChain
 
+from pipeline.callbacks import PipelineCallbackHandler
 from pipeline.models import PipelineConfig, PipelineState, StageInput, StageOutput
 from chains import (
     create_requirements_chain,
@@ -59,6 +60,9 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
     state = PipelineState(original_input=input_text)
     previous_output: dict | None = None
 
+    handler = PipelineCallbackHandler()
+    PipelineCallbackHandler.reset_totals()
+
     for stage_name in STAGE_ORDER:
         if not config.stage_enabled.get(stage_name, True):
             _log.info("Stage '%s' skipped (disabled)", stage_name)
@@ -79,7 +83,8 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
             config=config,
         )
 
-        output = await agent(inp)
+        handler.stage_name = stage_name
+        output = await agent(inp, callbacks=[handler])
         _update_state(state, stage_name, output)
         _log.info(
             "Stage '%s' completed, output length=%d",
@@ -98,6 +103,17 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
         await _write_output(config.output_dir, stage_name, output)
         _log.info("Stage '%s' artifacts written to '%s/'", stage_name, config.output_dir)
 
+    _log.info(
+        "\n═══════════════════════════════════════════════════════\n"
+        " Pipeline Summary\n"
+        "   Total Time:   %s ms\n"
+        "   Total Tokens: prompt=%s | completion=%s | total=%s\n"
+        "═══════════════════════════════════════════════════════",
+        handler.total_time_ms,
+        handler.total_prompt_tokens,
+        handler.total_completion_tokens,
+        handler.total_tokens,
+    )
     _log.info("Pipeline finished")
     return state
 

@@ -2,6 +2,12 @@
 
 ## 已完成
 
+- **Pipeline 运行状态实时可视化**：每次 LLM 调用后输出耗时、Token 消耗、累计总量
+  - 新增 `pipeline/callbacks.py`（`PipelineCallbackHandler`，基于 LangChain `BaseCallbackHandler`）
+  - 修改 `agents/__init__.py`（为 6 个 agent 函数添加 `callbacks` 参数）
+  - 修改 `pipeline/engine.py`（注入 handler，输出每个 Stage 可视化块 + Pipeline 汇总）
+  - 19 个测试全部通过
+
 - **LangChain 重构（升级到 RunnableSequence）**：将 Pipeline 从直接调用 `openai.AsyncOpenAI` 改为使用 LangChain
   - 升级 `LLMChain` → `RunnableSequence`（`prompt | llm` 语法）
   - 升级 `arun()` → `ainvoke()`（返回 `AIMessage`，需提取 `.content`）
@@ -11,7 +17,6 @@
   - 删除旧 agent 文件（ReqirementsAnalysis.py 等 6 个）
   - 删除旧 `prompt/template.py`
   - 更新 `test/test_pipeline.py`（mock 改为 `MagicMock` + patch 工厂函数）
-  - 19 个测试全部通过
 
 - **最小化 Pipeline 搭建**：完成 6 阶段 Pipeline 的基础结构
   - 新增 `pipeline/` 目录（models.py, engine.py, config_loader.py, __init__.py）
@@ -28,6 +33,9 @@
 - Pipeline 基础架构已完整搭建，CLI 可运行
 - 6 个 Agent 已实现，均调用 DeepSeek API
 - 测试覆盖：models 创建、config 验证、Agent mock 测试
+- 新增实时可视化回调，输出格式示例：
+  - 每个 Stage：`┌─ Stage: requirements ───────────────────── [SUCCESS] ─┐ │ Time: 1,234 ms │ Tokens: prompt=128 | completion=64 | total=192 │ Cumulative: time=1,234ms | tokens=192 └─────────────┘`
+  - 汇总：`═══════════════════════════════════════════════════════ Pipeline Summary Total Time: 8,456 ms Total Tokens: prompt=1,024 | completion=512 | total=1,536 ════════════════════════════════════════════════════════`
 
 ## 已知问题
 
