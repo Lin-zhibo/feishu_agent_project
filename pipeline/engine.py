@@ -98,7 +98,7 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
         )
 
         handler.stage_name = stage_name
-        output = await agent(inp, callbacks=[handler])
+        output = await agent(inp, callbacks=[handler], stream=True)
         _update_state(state, stage_name, output)
         _log.info(
             "Stage '%s' completed, output length=%d",
@@ -117,9 +117,12 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
         await _write_output(config.output_dir, stage_name, output)
         _log.info("Stage '%s' artifacts written to '%s/'", stage_name, config.output_dir)
 
+        # Print full stage output to console
+        _print_stage_output(stage_name, output, config.output_dir)
+
         # Checkpoint after "solution"
         if stage_name == "solution":
-            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints)
+            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, config.output_dir)
             if decision.decision == CheckpointDecision.REJECT:
                 if retry_counts["solution"] >= MAX_RETRY:
                     raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'solution'. Pipeline terminated.")
@@ -136,19 +139,62 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
 
         # Checkpoint after "review"
         if stage_name == "review":
-            decision = confirm_checkpoint("review", state.review_report or "", config.skip_checkpoints)
-            if decision.decision == CheckpointDecision.REJECT:
-                if retry_counts["review"] >= MAX_RETRY:
-                    raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'review'. Pipeline terminated.")
-                retry_counts["review"] += 1
-                _log.warning("Review rejected (attempt %d). Retrying code_gen.", retry_counts["review"])
-                state.code_diff = None
-                state.test_code = None
-                state.review_report = None
-                state.final_output = None
-                # Jump back to code_gen
-                stage_idx = STAGE_ORDER.index("code_gen")
-                continue
+            # Log AI review decision
+            if state.review_decision:
+                _log.info(
+                    "AI Review Decision: %s | Reason: %s | Critical Issues: %s",
+                    "PASS" if state.review_decision.passed else "FAIL",
+                    state.review_decision.reason,
+                    state.review_decision.severity_issues or [],
+                )
+
+            decision = confirm_checkpoint(
+                "review",
+                state.review_report or "",
+                config.skip_checkpoints,
+                config.output_dir,
+                review_decision=state.review_decision,
+            )
+
+            # State machine for review checkpoint
+            ai_passed = state.review_decision.passed if state.review_decision else True
+
+            if decision.decision == CheckpointDecision.APPROVE:
+                if ai_passed:
+                    # AI PASS + Human Approve → delivery
+                    _log.info("Review: AI PASS + Human Approve → delivery")
+                else:
+                    # AI FAIL + Human Override (allow_human_override) → delivery
+                    if config.allow_human_override_on_ai_fail:
+                        _log.info("Review: AI FAIL + Human Override → delivery (recorded)")
+                    else:
+                        # Should not happen if config is correct, but guard anyway
+                        _log.warning("Review: AI FAIL but Human Approve without override flag - treating as override")
+            else:
+                # Human Rejected
+                if ai_passed:
+                    # AI PASS + Human Reject → retry review with human feedback
+                    if retry_counts["review"] >= MAX_RETRY:
+                        raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'review'. Pipeline terminated.")
+                    retry_counts["review"] += 1
+                    _log.warning("Review rejected by human (attempt %d). Retrying review with feedback.", retry_counts["review"])
+                    state.review_report = None
+                    # Jump back to review
+                    stage_idx = STAGE_ORDER.index("review")
+                    continue
+                else:
+                    # AI FAIL + Human Reject → code_gen
+                    if retry_counts["review"] >= MAX_RETRY:
+                        raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'review'. Pipeline terminated.")
+                    retry_counts["review"] += 1
+                    _log.warning("Review AI FAIL + human reject (attempt %d). Retrying code_gen.", retry_counts["review"])
+                    state.code_diff = None
+                    state.test_code = None
+                    state.review_report = None
+                    state.final_output = None
+                    # Jump back to code_gen
+                    stage_idx = STAGE_ORDER.index("code_gen")
+                    continue
 
         stage_idx += 1
 
@@ -205,6 +251,7 @@ def _update_state(state: PipelineState, stage_name: str, output: StageOutput) ->
         state.test_code = output.content
     elif stage_name == "review":
         state.review_report = output.content
+        state.review_decision = output.review_decision
     elif stage_name == "delivery":
         state.final_output = output.content
 
@@ -223,3 +270,28 @@ async def _write_output(output_dir: str, stage_name: str, output: StageOutput) -
             json.dumps(output.artifacts, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
+
+
+def _print_stage_output(stage_name: str, output: StageOutput, output_dir: str) -> None:
+    """
+    Print full stage output to console for visibility.
+
+    Reads content from the output file (may be more complete than output.content
+    when tools were used during the stage).
+    """
+    print(f"\n{'='*70}")
+    print(f"  STAGE OUTPUT: {stage_name.upper()}")
+    print(f"{'='*70}")
+
+    # Try to read from file for complete content
+    content_file = Path(output_dir) / f"{stage_name}.md"
+    if content_file.exists():
+        file_content = content_file.read_text(encoding="utf-8")
+        if file_content.strip():
+            print(file_content)
+        else:
+            print(output.content or "(empty)")
+    else:
+        print(output.content or "(empty)")
+
+    print(f"{'='*70}\n")

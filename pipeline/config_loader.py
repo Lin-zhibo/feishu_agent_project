@@ -33,6 +33,8 @@ def load_settings(settings_path: str | Path) -> PipelineConfig:
         api_key="",
         base_url="https://api.deepseek.com",
         output_dir=raw.get("output_dir", "out"),
+        skip_checkpoints=raw.get("skip_checkpoints", False),
+        allow_human_override_on_ai_fail=raw.get("allow_human_override_on_ai_fail", False),
         stage_enabled=raw.get(
             "stage_enabled",
             {

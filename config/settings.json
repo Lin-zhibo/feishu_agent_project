@@ -1,5 +1,7 @@
 {
     "output_dir": "out",
+    "skip_checkpoints": false,
+    "allow_human_override_on_ai_fail": false,
     "stage_enabled": {
         "requirements": true,
         "solution": true,

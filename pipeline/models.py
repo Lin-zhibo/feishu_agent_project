@@ -22,6 +22,21 @@ class CheckpointDecision(Enum):
 
 
 @dataclass
+class ReviewDecision:
+    """
+    AI review decision with pass/fail and reasoning.
+
+    Attributes:
+        passed: True if review passed, False if rejected.
+        reason: Explanation of why the review passed or failed.
+        severity_issues: List of critical/high issues found (if any).
+    """
+    passed: bool
+    reason: str
+    severity_issues: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CheckpointResult:
     """
     Result of a checkpoint review.
@@ -62,12 +77,14 @@ class StageOutput:
         content: Human-readable output content (e.g., requirements doc, code diff).
         artifacts: Structured artifacts produced (e.g., code files, review reports).
         next_input: Dict to pass to the next stage as its current_input.
+        review_decision: AI review decision (only set for "review" stage).
     """
 
     stage_name: str
     content: str
     artifacts: dict[str, Any] = field(default_factory=dict)
     next_input: dict[str, Any] = field(default_factory=dict)
+    review_decision: ReviewDecision | None = None
 
 
 @dataclass
@@ -82,6 +99,7 @@ class PipelineState:
         code_diff: Output from the code generation stage.
         test_code: Output from the test generation stage.
         review_report: Output from the code review stage.
+        review_decision: AI review decision (passed/failed with reason).
         final_output: Output from the delivery integration stage.
     """
 
@@ -91,6 +109,7 @@ class PipelineState:
     code_diff: str | None = None
     test_code: str | None = None
     review_report: str | None = None
+    review_decision: ReviewDecision | None = None
     final_output: str | None = None
 
 
@@ -120,3 +139,4 @@ class PipelineConfig:
     })
     output_dir: str = "out"
     skip_checkpoints: bool = False  # When True, skip all Y/n confirmations
+    allow_human_override_on_ai_fail: bool = False  # When AI FAIL, human can override to pass

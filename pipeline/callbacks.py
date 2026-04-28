@@ -132,3 +132,23 @@ class PipelineCallbackHandler(BaseCallbackHandler):
         cls.total_prompt_tokens = 0
         cls.total_completion_tokens = 0
         cls.total_tokens = 0
+
+    def on_tool_start(
+        self,
+        serialized: dict[str, Any],
+        input_str: str,
+        **kwargs: Any,
+    ) -> None:
+        """Log when a tool is called."""
+        tool_name = serialized.get("name", "unknown") if serialized else "unknown"
+        _log.info(f"\n🔧 [TOOL CALL] {tool_name}")
+
+    def on_tool_end(
+        self,
+        output: str,
+        **kwargs: Any,
+    ) -> None:
+        """Log when a tool finishes."""
+        # Truncate long outputs for logging
+        output_preview = output[:200] + "..." if len(output) > 200 else output
+        _log.info(f"🔧 [TOOL RESULT] {output_preview}")

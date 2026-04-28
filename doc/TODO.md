@@ -2,6 +2,16 @@
 
 ## 已完成
 
+- **Review 阶段增强**：实现 AI 判断 + 人类审核的两阶段 checkpoint
+  - `pipeline/models.py`：新增 `ReviewDecision` 数据结构、`allow_human_override_on_ai_fail` 配置开关
+  - `prompts/review.py`：修改 prompt 要求结构化 VERDICT 输出（PASS/FAIL + Reason + Critical Issues）
+  - `agents/__init__.py`：新增 `_parse_review_decision()` 解析函数，填充 `StageOutput.review_decision`
+  - `pipeline/checkpoint.py`：`confirm_checkpoint` 支持展示 AI 判断结果（VERDICT 显示 + 不同操作提示）
+  - `pipeline/engine.py`：实现两阶段 checkpoint 状态机（AI PASS/FAIL + 人类审核组合）
+  - `config/settings.json`：新增 `skip_checkpoints`、`allow_human_override_on_ai_fail` 配置项
+  - `pipeline/config_loader.py`：加载新配置项
+  - 19 个测试全部通过
+
 - **Pipeline 运行状态实时可视化**：每次 LLM 调用后输出耗时、Token 消耗、累计总量
   - 新增 `pipeline/callbacks.py`（`PipelineCallbackHandler`，基于 LangChain `BaseCallbackHandler`）
   - 修改 `agents/__init__.py`（为 6 个 agent 函数添加 `callbacks` 参数）
@@ -36,6 +46,7 @@
 - 新增实时可视化回调，输出格式示例：
   - 每个 Stage：`┌─ Stage: requirements ───────────────────── [SUCCESS] ─┐ │ Time: 1,234 ms │ Tokens: prompt=128 | completion=64 | total=192 │ Cumulative: time=1,234ms | tokens=192 └─────────────┘`
   - 汇总：`═══════════════════════════════════════════════════════ Pipeline Summary Total Time: 8,456 ms Total Tokens: prompt=1,024 | completion=512 | total=1,536 ════════════════════════════════════════════════════════`
+- 已实现 WebSearch、WebFetch、ToolSearch、AskUserQuestion 四个工具并集成到 LangChain chains
 
 ## 已知问题
 

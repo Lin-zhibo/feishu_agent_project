@@ -1,124 +1,522 @@
-## 代码审查报告
+# Code Review Report — 微信小程序登录技术解决方案
 
-### 审查说明
-本次审查针对您提供的 **《微信小程序“微信登录”功能技术方案》** 设计文档。由于未提供具体的源代码实现，本报告将从架构设计、安全规范、最佳实践及潜在风险角度进行分析。文档整体思路清晰，技术选型合理，但存在部分设计细节缺失或可优化点，以下逐项列出。
+## Executive Summary
 
----
-
-### 1. 发现的问题
-
-#### **严重性：CRITICAL**
-
-| # | 问题描述 | 位置/场景 | 影响 |
-|---|----------|-----------|------|
-| 1 | **`session_key` 的存储未明确加密** | 文档第4节“关键实现说明” | 文档要求“session_key绝不能返回给前端”，但仅提到“保存在后端Redis中（加密后）”。若Redis中实际存储的是明文 `session_key`（例如设计稿中未明确定义存储格式），一旦Redis被入侵，可导致所有用户的敏感会话数据泄露。**严重性：如果未加密，则属于高危漏洞。** |
-| 2 | **`code` 防重放机制不完整** | 文档提到“应在缓存中标记该code为已使用”，但未说明标记的原子性与缓存时间。若未使用原子操作（如 Redis `SET` + `NX`）且未设置合理的TTL（与微信code有效期2~3分钟匹配），恶意请求可重复使用同一code。**攻击者可绕过登录逻辑。** |
-| 3 | **刷新令牌（refreshToken）的设计缺乏安全约束** | API 设计 `/api/v1/auth/refresh-token` | 文档未说明 refreshToken 如何生成、存储和校验。若 refreshToken 与 accessToken 使用相同密钥或未绑定用户设备/IP，一旦 refreshToken 泄露，攻击者可长期维持会话。且“方案二”中前端定期刷新会增加攻击面。 |
-
-#### **严重性：HIGH**
-
-| # | 问题描述 | 位置/场景 | 影响 |
-|---|----------|-----------|------|
-| 4 | **用户信息解密失败时缺乏优雅回退机制** | 用户同步信息接口 `POST /api/v1/user/sync-info` | 解密失败后文档仅建议“引导用户重新登录”，但未提供替代方案（如仅存储openid，后续允许用户手动填写昵称）。这会破坏用户体验，且在高并发下可能触发大量重新登录。 |
-| 5 | **限流策略未区分敏感接口** | 文档仅提“对 `/api/v1/auth/login` 进行限流”，但未对 `refresh-token` 和 `sync-info` 接口实施限流。大量刷新请求仍可滥用服务器资源。 |
-| 6 | **MySQL `openid` 索引虽设为 UNIQUE，但缺少对 `unionid` 的说明** | 文档提到 `openid` 建立唯一索引，但未提及 `unionid` 也应为唯一索引（若存在）。不同微信开放平台下的同一用户可能拥有不同 `openid`，若 `unionid` 无唯一约束，将导致数据冗余甚至冲突。 |
-
-#### **严重性：MEDIUM**
-
-| # | 问题描述 | 位置/场景 | 影响 |
-|---|----------|-----------|------|
-| 7 | **分布式锁的细节缺失** | 第4节“code2Session 的幂等性和并发处理” | 描述中提到使用 Redis `SETNX`，但未说明锁的超时时间（防止死锁）、重试策略以及锁释放机制。若锁未正确释放，可能导致大量请求等待，用户登录响应时间飙升。 |
-| 8 | **用户信息敏感字段未脱敏** | 用户信息接口 `GET /api/v1/user/info` 返回完整用户信息 | 若返回的手机号、真实姓名等（虽文档未列，但扩展时应考虑），后端应脱敏处理，避免前端直接展示完整数据。 |
-| 9 | **日志记录不够详细** | 全局日志中间件 `logger.middleware.js` | 文档仅提及请求日志，未明确记录关键操作（如登录成功/失败、解密失败、token刷新成功/失败）及错误栈，不利于问题追踪。 |
-
-#### **严重性：LOW**
-
-| # | 问题描述 | 位置/场景 | 影响 |
-|---|----------|-----------|------|
-| 10 | **API 版本化路径 `/api/v1/` 未做向后兼容计划** | 所有 API 路径 | 若后续修改接口参数/响应格式，缺少版本更新策略，可能导致旧版客户端不可用。 |
-| 11 | **文档缺少对微信最新政策的说明** | 用户信息获取部分 | 提到 `wx.getUserProfile` 已废弃，但未给出替代方案（如使用 `wx.getUserInfo` 配合 `open-type` 按钮）。若按旧方案实现，可能被微信审核拒绝。 |
+This is a **well-structured and thorough** design document covering architecture, API design, security considerations, and observability. However, I found **several critical runtime bugs** that would prevent the code from working, **security violations** against WeChat's official recommendations, and **design flaws** in token/encryption handling.
 
 ---
 
-### 2. 改进建议
+## 1️⃣ CRITICAL Issues
 
-#### **CRITICAL 问题改进**
+### CRITICAL-1: `session_key` Stored in Database (Violates WeChat Security Model)
 
-1.  **明确加密存储 `session_key`**  
-    在 `Redis` 中存储 `session_key` 时，应使用 AES-256 或 HMAC 加密后再存储，密钥从环境变量中读取。每次使用时解密。示例伪代码：
-    ```javascript
-    // 存储
-    const encrypted = encrypt(session_key, process.env.SESSION_KEY_ENCRYPT_KEY);
-    await redis.set(`session_key:${openid}`, encrypted, 'EX', 3600);
-    
-    // 读取
-    const encrypted = await redis.get(`session_key:${openid}`);
-    const session_key = decrypt(encrypted, process.env.SESSION_KEY_ENCRYPT_KEY);
-    ```
+**File:** `src/modules/security/encryption.service.ts` + `backend/src/modules/auth/auth.service.ts`
 
-2.  **完善 `code` 防重放机制**  
-    使用 Redis 的 `SETNX` 实现且设置与微信 code 相同的过期时间（约 180 秒）。建议：
-    ```javascript
-    const key = `code:${code}`;
-    const acquired = await redis.set(key, openid, 'EX', 180, 'NX'); // 仅当key不存在时设置
-    if (!acquired) {
-        // code已被使用
-        return error('1002', 'Code已使用');
-    }
-    ```
-    同时，确保 `code2Session` 调用失败时也删除该 key 避免永久占用。
+```sql
+encrypted_session_key TEXT,              -- AES-256-GCM 加密存储
+session_key_iv  VARCHAR(64),
+```
 
-3.  **强化刷新令牌（refreshToken）安全**  
-    - refreshToken 应使用独立的密钥签名（或为随机字符串+HMAC），且设置更长的过期时间（如7天）。  
-    - 存储 refreshToken 时应关联 `user_id` 及设备指纹（如User-Agent+IP哈希）。  
-    - 刷新时验证设备指纹，如不匹配则要求重新登录。  
-    - 避免前端自动频繁刷新，改为在收到 401 时按需刷新（推荐方案一）。
+**Problem:**  
+Per [WeChat Official Documentation](https://developers.weixin.qq.com/miniprogram/dev/framework/open-ability/login.html):
+> "Session key 是数据解密的关键，**开发者不应该在本地或数据库中以明文或加密形式存储 session_key**。"
 
-#### **HIGH 问题改进**
+Storing `session_key` — even encrypted in AES-256-GCM — violates WeChat's security guidelines. The `session_key` has **no guaranteed validity period** and can be refreshed by WeChat at any time. If the encryption key is compromised, all historical `session_key` values are exposed.
 
-4.  **用户信息解密失败时提供降级策略**  
-    若解密失败（如 `session_key` 过期），可返回错误码 `1004` 并引导前端调用 `wx.login()` 获取新 code 重新登录。同时后端记录错误日志，允许用户手动编辑昵称/头像（存储为自定义字段），不影响后续操作。
+**Fix:**  
+- Store `session_key` in **Redis only** with a short TTL (e.g., 5 minutes) for the immediate login session
+- If you need to decrypt user data later (e.g., phone number), re-invoke `code2session` to get a fresh key
+- Alternatively, encrypt/decrypt data immediately during the login flow and discard the key
 
-5.  **为所有敏感接口添加限流**  
-    使用 `express-rate-limit` 统一配置，为 `/auth/login`、`/auth/refresh-token`、`/user/sync-info` 等设置不同阈值（如 login 每天每用户 50 次，refresh-token 每 5 分钟 5 次等）。建议将限流数据存入 Redis 以实现分布式计数。
-
-6.  **强制 `unionid` 唯一索引**  
-    如果业务需要 `unionid`，应在 MySQL 中为 `unionid` 字段创建唯一索引（注意 `unionid` 可能为 NULL，可考虑使用虚拟列或空字符串处理）。同时建议在 `auth.service` 中处理 `unionid` 的合并/迁移逻辑。
-
-#### **MEDIUM 问题改进**
-
-7.  **实现健壮的分布式锁**  
-    - 设置锁超时（如 5 秒），防止死锁。  
-    - 使用 Redlock 或更简单的 `SET resource_name my_random_value NX PX 30000`，并在释放锁时通过 Lua 脚本验证 value 一致。  
-    - 失败时采用指数退避重试（最多 3 次，间隔 100ms、200ms、400ms）。  
-    - 若最终未获取锁，返回“系统繁忙”错误而非阻塞等待。
-
-8.  **对敏感字段脱敏**  
-    在 `user.service` 中，对于 `phone`、`email` 等字段，只返回部分字符（如 `138****1234`）。可定义脱敏工具函数，并在返回前调用。
-
-9.  **结构化日志与监控**  
-    - 选用 `winston` + `elasticsearch` 或 `pino` + `logstash`，记录结构化 JSON 日志。  
-    - 关键操作（登录、解密、刷新）必含 `userId`、`openid`、`traceId`、`errorStack`（如果有）。  
-    - 配置健康检查端点 `/health` 并集成 Prometheus 监控请求量、错误率、延迟。
-
-#### **LOW 问题改进**
-
-10. **制定 API 版本兼容策略**  
-    - 采用 /api/v1/、/api/v2/ 路径隔离。  
-    - 当接口变更时，保留旧版本至少一个发布周期，并在响应体中增加 `version` 字段供客户端检测。  
-    - 发布前通过灰度测试验证旧版本调用正常。
-
-11. **及时跟进微信官方 API 变更**  
-    - 确认当前可用 API（`wx.getUserProfile` 已下线，使用 `<button open-type="chooseAvatar">` 或 `<open-data>` 组件）。  
-    - 更新设计文档，对应调整 `sync-info` 接口的实现（例如：前端获取到头像URL和昵称后，直接提交明文，后端仅需校验并存储。解密接口已不再需要）。  
-    - 代码中添加注释注明微信 API 版本依赖，便于后续排查。
+```typescript
+// ✅ Correct approach: Redis cache with TTL
+await this.redisService.set(
+  `session_key:${user.id}`,
+  wechatRes.session_key,
+  300  // 5 minutes TTL only
+);
+```
 
 ---
 
-### 补充建议（超越文档范围）
+### CRITICAL-2: `dataSource` Not Injected in AuthService → Runtime Crash
 
-- **数据备份与恢复**：定期备份 MySQL 并测试恢复流程。Redis 应启用持久化（RDB+AOF）以防数据丢失。  
-- **CI/CD 与测试**：建议为 `auth.service` 编写单元测试（mock `wx.login` 和 Redis），并集成到流水线，防止回归。  
-- **前端 Token 存储**：小程序中 token 应存入 `wx.setStorageSync`（安全等级一般），避免使用全局变量防止页面刷新丢失。对于高安全性场景，可考虑使用 `HTTP-Only` Cookie（需后端配置域名限制），但小程序中更常见的是 Storage。
+**File:** `src/modules/auth/auth.service.ts` (line ~48)
 
-如需针对具体代码文件进行审查，请提供实际的代码片段。以上审查仅基于设计文档，已指出潜在风险并给出可落地的改进措施。
+```typescript
+@Injectable()
+export class AuthService {
+  constructor(
+    private readonly wechatService: WechatService,
+    private readonly userService: UserService,
+    private readonly tokenService: TokenService,
+    private readonly encryptionService: EncryptionService,
+  ) {}  // ⚠️ DataSource NOT injected!
+
+  async login(params: LoginParams): Promise<LoginResult> {
+    // ...
+    return await this.dataSource.transaction(async (manager) => {
+      // ^^^^ TypeError: Cannot read properties of undefined (reading 'transaction')
+```
+
+**Problem:**  
+`this.dataSource` is used but never injected. This will throw a **runtime `TypeError`** on every login attempt.
+
+**Fix:**
+```typescript
+constructor(
+  private readonly dataSource: DataSource,  // ✅ Must inject
+  private readonly wechatService: WechatService,
+  // ...
+) {}
+```
+
+---
+
+### CRITICAL-3: AES-256-GCM Auth Tag Not Persisted → Decryption Always Fails
+
+**File:** `src/modules/security/encryption.service.ts` vs Database Schema
+
+```typescript
+// encrypt() returns: { ciphertext: string; iv: string; tag: string }
+// But database stores only:
+encrypted_session_key TEXT,    // stores ciphertext only
+session_key_iv  VARCHAR(64),  // stores iv only
+// ⚠️ NO column for 'tag'!
+```
+
+**Problem:**  
+AES-256-GCM **requires** the authentication tag for decryption. The `tag` is returned by `encrypt()` but the database schema has no column to store it. When `decrypt(ciphertext, ivHex, tagHex)` is called later, `tagHex` cannot be retrieved → **decryption always throws**.
+
+**Fix:**
+```sql
+encrypted_session_key TEXT,              -- AES-256-GCM encrypted data
+session_key_iv  VARCHAR(64),             -- Initialization Vector
+session_key_tag VARCHAR(64),             -- ✅ Authentication Tag (GCM)
+```
+
+Or combine them:
+```typescript
+// Store combined: iv:tag:ciphertext (base64)
+const combined = `${iv.toString('hex')}:${tag}:${encrypted}`;
+```
+
+---
+
+### CRITICAL-4: `checkCodeReuse()` Queries Wrong Table / Missing Repository Injection
+
+**File:** `src/modules/wechat/wechat.service.ts` (shown in section 4.4.2)
+
+```typescript
+async checkCodeReuse(code: string): Promise<void> {
+  const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+  
+  const exists = await this.userRepository.findOne({  // ⚠️ Not injected!
+    where: { codeHash },  // ⚠️ Not a column on users table!
+    select: ['id'],
+  });
+```
+
+**Problems:**  
+1. `this.userRepository` is **not injected** into `WechatService`  
+2. `codeHash` is a column in `login_audits`, **not** in `users`  
+3. This method is **never called** in the login flow shown in `AuthService`  
+
+**Fix:**
+```typescript
+// Move to a dedicated audit service with proper injection
+@Injectable()
+export class AuditService {
+  constructor(
+    @InjectRepository(LoginAudit)
+    private readonly auditRepository: Repository<LoginAudit>,  // ✅ login_audits
+  ) {}
+
+  async checkCodeReuse(code: string): Promise<void> {
+    const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+    const exists = await this.auditRepository.findOne({
+      where: { codeHash },
+      select: ['id'],
+    });
+    if (exists) throw new UnauthorizedException({ code: 40102, ... });
+  }
+}
+```
+
+---
+
+### CRITICAL-5: Refresh Token API Call in Interceptor Missing Authorization Header
+
+**File:** `miniprogram/interceptors/token.interceptor.ts`
+
+```typescript
+private async refreshToken(): Promise<boolean> {
+  const refreshToken = this.storageService.get('refreshToken');
+  if (!refreshToken) return false;
+  
+  const res = await this._request({
+    url: '/api/v1/auth/refresh',
+    method: 'POST',
+    data: { refreshToken }
+    // ⚠️ Missing Authorization header!
+  });
+```
+
+**Problem:**  
+The API spec (section 3.2.2) requires:
+```
+Authorization: Bearer <refresh_token>
+```
+But the interceptor only sends `data: { refreshToken }` in the body. The backend likely checks the header → **refresh always fails**.
+
+**Fix:**
+```typescript
+const res = await this._request({
+  url: '/api/v1/auth/refresh',
+  method: 'POST',
+  header: { 'Authorization': `Bearer ${refreshToken}` },  // ✅
+  data: { refreshToken }
+});
+```
+
+---
+
+## 2️⃣ HIGH Issues
+
+### HIGH-1: Race Condition in Concurrent Login — No Implementation
+
+**File:** Section 4.7 (Boundary Conditions table)
+
+| 场景 | 预期行为 |
+|------|----------|
+| 并发重复登录 | 后一次请求覆盖前一次 Token，旧 Token 加入黑名单 |
+
+**Problem:**  
+The boundary table describes correct behavior, but **no code implements this**. When two login requests arrive simultaneously:
+- Both call `code2session` — one will get `CODE_USED` (40102)
+- Both may try to `createUser` if user doesn't exist — potential unique constraint violation
+- Both generate different token pairs — last write wins, but no blacklisting of the overwritten token
+
+**Fix:**  
+Add pessimistic locking or application-level locks:
+```typescript
+async login(params: LoginParams): Promise<LoginResult> {
+  const wechatRes = await this.wechatService.code2Session(params.code);
+  
+  // ✅ Distributed lock to prevent concurrent registration
+  const lockKey = `login:${wechatRes.openid}`;
+  const acquired = await this.redisService.setnx(lockKey, '1', 10); // 10s TTL
+  if (!acquired) {
+    // Retry or queue
+  }
+  
+  try {
+    return await this.dataSource.transaction(async (manager) => {
+      // ... login logic
+    });
+  } finally {
+    await this.redisService.del(lockKey);
+  }
+}
+```
+
+---
+
+### HIGH-2: Rate Limiter `incr` + `expire` Is Not Atomic
+
+**File:** `src/modules/security/rate-limiter.service.ts`
+
+```typescript
+const current = await this.redisService.incr(windowKey);
+if (current === 1) {
+  await this.redisService.expire(windowKey, windowSeconds);  // ⚠️ Race condition
+}
+```
+
+**Problem:**  
+If Redis crashes or the server restarts between `incr` and `expire`, the key persists **without an expiry**, permanently blocking that client.
+
+**Fix:** Use Redis `SET` with `NX` + `EX` or a Lua script:
+```typescript
+// ✅ Option 1: SET with NX and EX
+const result = await this.redisService.set(
+  windowKey, 1, 'NX', 'EX', windowSeconds
+);
+if (result) { /* first request */ }
+
+// ✅ Option 2: Lua script (atomic)
+const luaScript = `
+  local current = redis.call('INCR', KEYS[1])
+  if current == 1 then
+    redis.call('EXPIRE', KEYS[1], ARGV[1])
+  end
+  return current
+`;
+```
+
+---
+
+### HIGH-3: `Throttle` Decorator Requires Guard — Not Registered
+
+**File:** `src/modules/auth/auth.controller.ts`
+
+```typescript
+@Throttle({ default: { limit: 60, ttl: 60000 } })
+```
+
+**Problem:**  
+`@Throttle()` from `@nestjs/throttler` only defines metadata. It **requires** `ThrottlerGuard` to be applied (globally or at controller level). Without registration, the decorator is a **no-op**.
+
+**Fix:**
+```typescript
+// In app.module.ts or auth.module.ts
+import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerGuard } from '@nestjs/throttler';
+
+@Module({
+  providers: [
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,  // ✅ Register globally
+    },
+  ],
+})
+```
+
+---
+
+### HIGH-4: `Math.random()` for RequestId — Not Cryptographically Secure
+
+**File:** `src/modules/auth/auth.controller.ts`
+
+```typescript
+return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+```
+
+**Problem:**  
+`Math.random()` is **not cryptographically secure** and can be predicted. For `requestId` this is more about collision risk and audit integrity — a collision would break request tracing.
+
+**Fix:**
+```typescript
+import { randomUUID } from 'crypto';
+
+return `req_${randomUUID()}`;
+// or: nanoId / uuid v4
+```
+
+---
+
+### HIGH-5: No JWT Secret Rotation or Key Management Strategy
+
+**File:** `src/config/jwt.config.ts` / `.env`
+
+```
+JWT_SECRET=your-256-bit-jwt-secret-in-base64
+```
+
+**Problem:**  
+The document mentions no key rotation strategy. If the JWT secret is compromised:
+- All existing tokens (access + refresh, up to 30d validity) can be forged
+- No mention of `kid` (key ID) header to support multiple signing keys
+
+**Fix:**
+```typescript
+// Use JWKS or at minimum support key rotation:
+const jwtConfig = {
+  secret: process.env.JWT_SECRET,
+  signOptions: {
+    keyid: process.env.JWT_KID || 'v1',  // ✅ key ID for rotation
+    expiresIn: '7d',
+  },
+};
+
+// When rotating: add new key as 'v2', old tokens with 'v1' still validate
+```
+
+---
+
+## 3️⃣ MEDIUM Issues
+
+### MEDIUM-1: AuthService Not Injectable in `checkCodeReuse` — Dead Code
+
+`checkCodeReuse` is defined but **never invoked** in the login flow. The `AuthService.login()` method goes directly to `code2Session` without calling `checkCodeReuse` first. This means code reuse protection (idempotency) is **not actually enforced**.
+
+### MEDIUM-2: `SkipThrottle` Imported But Unused
+
+```typescript
+import { SkipThrottle } from '@nestjs/throttler';  // Unused import
+```
+
+### MEDIUM-3: `getDeviceInfo()` Calls Synchronous Blocking APIs
+
+```typescript
+private getDeviceInfo(): DeviceInfo {
+  const info = wx.getSystemInfoSync();      // Blocks
+  const accountInfo = wx.getAccountInfoSync();  // Blocks
+```
+
+On every login, two synchronous native calls block the main thread. For better UX:
+```typescript
+// Pre-fetch in app.ts onLaunch and cache
+async getDeviceInfo(): Promise<DeviceInfo> {
+  const [info, accountInfo] = await Promise.all([
+    wx.getSystemInfoAsync(),      // ✅ Async version
+    wx.getAccountInfoSync(),      // No async alternative, but cache it
+  ]);
+}
+```
+
+### MEDIUM-4: `reLaunch` in `app.ts` — May Cause Loop on Deep Links
+
+```typescript
+wx.reLaunch({ url: '/pages/home/index' });
+```
+
+If the user opened a **deep link** to `/pages/profile/index`, auto-navigating to `/pages/home/index` breaks that intent. Consider:
+```typescript
+// Only navigate if user is on the login page
+const pages = getCurrentPages();
+if (pages.length === 1 && pages[0].route === 'pages/login/index') {
+  wx.reLaunch({ url: '/pages/home/index' });
+}
+```
+
+### MEDIUM-5: No Validation on `deviceInfo` Fields
+
+```typescript
+// DTO validation
+export class WechatLoginDto {
+  @IsString()
+  @IsNotEmpty()
+  code: string;
+  
+  deviceInfo: DeviceInfo;  // ⚠️ No @ValidateNested() or inner validation
+}
+```
+
+**Fix:**
+```typescript
+export class DeviceInfoDto {
+  @IsString()
+  @IsOptional()
+  platform?: string;
+  // ...
+}
+
+export class WechatLoginDto {
+  @IsString()
+  @IsNotEmpty()
+  code: string;
+  
+  @ValidateNested()
+  @Type(() => DeviceInfoDto)
+  deviceInfo: DeviceInfoDto;
+}
+```
+
+---
+
+## 4️⃣ LOW Issues
+
+### LOW-1: Private `sanitizeUser()` Harder to Unit Test
+
+```typescript
+private sanitizeUser(user: User): SanitizedUser {
+```
+
+Make it `public` or extract to a pure function for testability.
+
+### LOW-2: Index on `login_audits.created_at` Without Query Pattern
+
+```sql
+CREATE INDEX idx_login_audits_created_at ON login_audits(created_at);
+```
+
+If queries typically filter `WHERE user_id = ? AND created_at > ?`, consider a **composite index**:
+```sql
+CREATE INDEX idx_login_audits_user_created ON login_audits(user_id, created_at);
+```
+
+### LOW-3: `code_hash` Unique Index Allows NULLs (Defeats Uniqueness)
+
+```sql
+CREATE UNIQUE INDEX idx_login_audits_code_hash ON login_audits(code_hash) 
+    WHERE code_hash IS NOT NULL;
+```
+
+PostgreSQL allows multiple NULL values in a unique index. If `code_hash` is nullable, the uniqueness constraint is effectively **bypassed** for any row where code_hash is NULL. Consider making `code_hash` NOT NULL.
+
+### LOW-4: Missing `Crypto` Import in `checkCodeReuse` Snippet
+
+```typescript
+const codeHash = crypto.createHash('sha256').update(code).digest('hex');
+```
+
+The `crypto` module is imported in `encryption.service.ts` but **not shown** in the `checkCodeReuse` code snippet.
+
+---
+
+## 5️⃣ Suggestions for Improvement
+
+### Suggestion 1: Token Family / Rotation Chain
+
+**Current:** When refreshing, both access + refresh tokens are replaced. Old refresh tokens remain valid until expiry.
+
+**Better:** Implement **refresh token rotation** — invalidate the old refresh token when issuing a new one. This detects token theft (if a stolen refresh token is used after rotation).
+
+```typescript
+// On refresh:
+await this.redisService.del(`refresh:${oldJti}`);  // Invalidate old
+await this.redisService.set(`refresh:${newJti}`, userId, 30 * 86400);  // New
+```
+
+### Suggestion 2: Circuit Breaker State Persistence
+
+The `CircuitBreaker` is in-memory. In a multi-instance deployment, one instance might be open while others keep hammering the failing WeChat API. Consider using Redis for circuit breaker state.
+
+### Suggestion 3: Structured Logging — Add Trace ID Propagation
+
+The `requestId` is generated per request but not propagated to **downstream calls** (e.g., WeChat API calls). Add it as a correlation ID in all service log entries for full traceability.
+
+### Suggestion 4: Graceful Degradation for WeChat API Outage
+
+Add a **fallback mechanism**: if the WeChat API is unreachable for extended periods, consider allowing previously authenticated users to continue using cached tokens without re-validation (with appropriate warnings).
+
+### Suggestion 5: Add Security Headers
+
+In the Nginx layer, add:
+```
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+```
+
+---
+
+## Summary Table
+
+| # | Severity | Category | Issue |
+|---|----------|----------|-------|
+| CR-1 | **CRITICAL** | Security | `session_key` stored in DB violates WeChat policy |
+| CR-2 | **CRITICAL** | Runtime Error | `dataSource` not injected → `TypeError` on login |
+| CR-3 | **CRITICAL** | Bug | GCM auth tag not persisted → decryption always fails |
+| CR-4 | **CRITICAL** | Runtime Error | `checkCodeReuse()` uses wrong repo/table, never called |
+| CR-5 | **CRITICAL** | API Contract | Refresh call missing `Authorization` header |
+| H-1 | **HIGH** | Race Condition | Concurrent login not handled in code |
+| H-2 | **HIGH** | Reliability | Rate limiter `incr`+`expire` not atomic |
+| H-3 | **HIGH** | Configuration | `@Throttle` guard not registered → no rate limiting |
+| H-4 | **HIGH** | Security | `Math.random()` for request ID not crypto-safe |
+| H-5 | **HIGH** | Security | No JWT key rotation strategy |
+| M-1 | **MEDIUM** | Dead Code | `checkCodeReuse` defined but never invoked |
+| M-2 | **MEDIUM** | Code Quality | Unused import `SkipThrottle` |
+| M-3 | **MEDIUM** | Performance | Synchronous blocking calls in `getDeviceInfo` |
+| M-4 | **MEDIUM** | UX | `reLaunch` breaks deep linking |
+| M-5 | **MEDIUM** | Validation | Missing `@ValidateNested` on `deviceInfo` |
+| L-1 | **LOW** | Testability | Private method `sanitizeUser` |
+| L-2 | **LOW** | Performance | Suboptimal index on `login_audits` |
+| L-3 | **LOW** | Data Integrity | Unique index allows NULL code_hash |
+| L-4 | **LOW** | Documentation | Missing `crypto` import in code snippet |
+
+---
+
+**Overall Assessment:** The architecture is sound and well-documented, but **CRITICAL-2, CRITICAL-3, and CRITICAL-4 are production-blocking bugs** that would crash the service. **CRITICAL-1** requires an architectural decision to align with WeChat's security model. I recommend addressing all Critical and High issues before merging this design into development.
