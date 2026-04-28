@@ -50,11 +50,19 @@
 
 ## 已知问题
 
+- **astream() 工具调用失效**：code_gen 使用 astream() 时只输出描述性文本（如 "I'll start by examining..."），没有真正调用工具生成代码
+  - 原因：astream() 在工具调用时可能不会正确处理中间输出
+  - 状态：未解决，可能需要回退到 ainvoke()
+- **requirements 阶段输出残缺**：LLM 调用 AskUserQuestion 工具时只返回开场白，内容不完整
+  - 原因：工具调用时 output.content 可能为空
+  - 状态：未解决
 - 需要真实 API Key 才能端到端运行（当前配置从 config/model.json 读取）
 - Agent 之间传递的 `previous_output` 目前仅传递 `requirements` 和 `solution`，其他字段依赖 engine 中的累积字典
 
 ## 下一步
 
+- [ ] 修复 astream() 工具调用失效问题（考虑回退到 ainvoke()）
+- [ ] 修复 requirements 阶段输出残缺问题
 - [ ] 配置真实 API Key 并端到端测试 `python cli.py --input "用户登录功能"`
 - [ ] 实现输出文件的实际写入逻辑（out/ 目录）
 - [ ] 补充 Agent 间更多上下文传递
