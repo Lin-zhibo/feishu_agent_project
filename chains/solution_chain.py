@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 
 from pipeline.models import PipelineConfig
 from prompts import SOLUTION_PROMPT
+from tools import STAGE_TOOLS
 
 
 def create_solution_chain(config: PipelineConfig) -> RunnableSequence:
@@ -26,4 +27,4 @@ def create_solution_chain(config: PipelineConfig) -> RunnableSequence:
         base_url=config.base_url,
         temperature=0.3,
     )
-    return SOLUTION_PROMPT | llm
+    return SOLUTION_PROMPT | llm.bind_tools(STAGE_TOOLS["solution"])

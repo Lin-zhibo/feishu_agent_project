@@ -8,6 +8,7 @@ from langchain_openai import ChatOpenAI
 
 from pipeline.models import PipelineConfig
 from prompts import CODE_GEN_PROMPT
+from tools import STAGE_TOOLS
 
 
 def create_code_gen_chain(config: PipelineConfig) -> RunnableSequence:
@@ -26,4 +27,4 @@ def create_code_gen_chain(config: PipelineConfig) -> RunnableSequence:
         base_url=config.base_url,
         temperature=0.3,
     )
-    return CODE_GEN_PROMPT | llm
+    return CODE_GEN_PROMPT | llm.bind_tools(STAGE_TOOLS["code_gen"])
