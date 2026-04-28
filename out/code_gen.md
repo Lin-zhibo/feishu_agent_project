@@ -1,519 +1,909 @@
 ```diff
-diff --git a/self-intro-service/main.py b/self-intro-service/main.py
-new file mode 100644
-index 0000000..f3a9b7e
 --- /dev/null
-+++ b/self-intro-service/main.py
-@@ -0,0 +1,101 @@
-+import os
-+import yaml
-+from flask import Flask, request, jsonify
-+from handlers.introduction_handler import IntroductionHandler
-+from handlers.follow_up_handler import FollowUpHandler
-+from services.intent_detector import IntentDetector
-+from services.language_detector import LanguageDetector
++++ b/miniprogram/app.js
+@@ -0,0 +1,33 @@
++// app.js
++const auth = require('./utils/auth');
++const request = require('./utils/request');
 +
-+app = Flask(__name__)
-+
-+# In-memory configuration cache
-+CONFIG_CACHE = {}
-+CONFIG_DIR = os.path.join(os.path.dirname(__file__), 'config')
-+
-+def load_configs():
-+    """Load all YAML config files into cache."""
-+    global CONFIG_CACHE
-+    CONFIG_CACHE.clear()
-+    for filename in os.listdir(CONFIG_DIR):
-+        if filename.startswith('introduction_') and filename.endswith('.yaml'):
-+            lang_code = filename.replace('introduction_', '').replace('.yaml', '')
-+            filepath = os.path.join(CONFIG_DIR, filename)
-+            with open(filepath, 'r', encoding='utf-8') as f:
-+                CONFIG_CACHE[lang_code] = yaml.safe_load(f)
-+
-+# Load configs at startup
-+load_configs()
-+
-+# Instantiate services
-+intent_detector = IntentDetector()
-+language_detector = LanguageDetector()
-+intro_handler = IntroductionHandler(CONFIG_CACHE)
-+follow_up_handler = FollowUpHandler(CONFIG_CACHE)
-+
-+@app.route('/api/introduction', methods=['POST'])
-+def handle_introduction():
-+    """Main endpoint for self-introduction requests."""
-+    data = request.get_json()
-+    if not data or 'message' not in data:
-+        return jsonify({'error': 'Missing or empty message field'}), 400
-+
-+    user_message = data['message'].strip()
-+    if not user_message:
-+        return jsonify({'error': 'Message cannot be empty'}), 400
-+
-+    # Determine intent
-+    intent = intent_detector.detect(user_message)
-+
-+    if intent == 'introduction':
-+        # Detect language
-+        language = language_detector.detect(user_message)
-+        try:
-+            response_text, follow_up = intro_handler.generate(language)
-+            return jsonify({
-+                'response': response_text,
-+                'language': language,
-+                'follow_up_prompt': follow_up
-+            })
-+        except ValueError as e:
-+            return jsonify({'error': str(e)}), 500
-+
-+    elif intent == 'follow_up':
-+        # Use the language of the current request (or default to English)
-+        language = language_detector.detect(user_message)
-+        try:
-+            response_text = follow_up_handler.generate(language)
-+            return jsonify({
-+                'response': response_text,
-+                'language': language,
-+                'follow_up_prompt': None
-+            })
-+        except ValueError as e:
-+            return jsonify({'error': str(e)}), 500
-+
-+    else:
-+        # Unknown intent – return a generic help message
-+        return jsonify({
-+            'response': "I'm here to introduce myself. Try saying 'Introduce yourself'.",
-+            'language': 'en',
-+            'follow_up_prompt': None
++App({
++  onLaunch: function () {
++    // Check token validity on app launch
++    const token = auth.getToken();
++    if (token) {
++      request.get('/api/user/me')
++        .then(res => {
++          console.log('User already logged in:', res.data.id);
++          wx.switchTab({ url: '/pages/index/index' });
 +        })
-+
-+@app.route('/health', methods=['GET'])
-+def health():
-+    """Health check endpoint."""
-+    return jsonify({'status': 'ok'})
-+
-+@app.errorhandler(500)
-+def internal_error(error):
-+    return jsonify({'error': 'Internal server error'}), 500
-+
-+@app.errorhandler(404)
-+def not_found(error):
-+    return jsonify({'error': 'Not found'}), 404
-+
-+if __name__ == '__main__':
-+    # For development only
-+    app.run(host='0.0.0.0', port=5000, debug=True)
-+
-+# Background config reload (every 60 seconds)
-+import threading
-+def reload_config_periodically():
-+    threading.Timer(60.0, reload_config_periodically).start()
-+    load_configs()
-+
-+# Start background reload in production (optional)
-+# reload_config_periodically()
-diff --git a/self-intro-service/handlers/__init__.py b/self-intro-service/handlers/__init__.py
-new file mode 100644
-index 0000000..e69de29
++        .catch(err => {
++          if (err.status === 401) {
++            auth.clearToken();
++            wx.redirectTo({ url: '/pages/login/login' });
++          }
++        });
++    } else {
++      wx.redirectTo({ url: '/pages/login/login' });
++    }
++  },
++  globalData: {
++    userInfo: null
++  }
++});
 --- /dev/null
-+++ b/self-intro-service/handlers/__init__.py
-@@ -0,0 +1 @@
-+# Empty
-diff --git a/self-intro-service/handlers/follow_up_handler.py b/self-intro-service/handlers/follow_up_handler.py
-new file mode 100644
-index 0000000..cffd392
++++ b/miniprogram/utils/constants.js
+@@ -0,0 +1,7 @@
++// constants.js
++const API_BASE_URL = 'https://yourdomain.com/api'; // Replace with actual domain
++const TOKEN_KEY = 'wechat_token';
++const ERROR_CODES = {
++  INVALID_CODE: 'invalid_code',
++  RATE_LIMITED: 'rate_limited',
++  SERVER_ERROR: 'server_error'
++};
++module.exports = { API_BASE_URL, TOKEN_KEY, ERROR_CODES };
 --- /dev/null
-+++ b/self-intro-service/handlers/follow_up_handler.py
-@@ -0,0 +1,34 @@
-+class FollowUpHandler:
-+    """Generates follow-up messages for users who want more details."""
++++ b/miniprogram/utils/auth.js
+@@ -0,0 +1,18 @@
++// auth.js
++const { TOKEN_KEY } = require('./constants');
 +
-+    def __init__(self, config_cache):
-+        self.config_cache = config_cache
++function getToken() {
++  return wx.getStorageSync(TOKEN_KEY) || null;
++}
 +
-+    def generate(self, language):
-+        """Return the follow-up text for the given language."""
-+        config = self.config_cache.get(language)
-+        if not config:
-+            # Fallback to English if language config missing
-+            config = self.config_cache.get('en', {})
-+        follow_up = config.get('follow_up', {})
-+        prompt = follow_up.get('prompt', 'Would you like to know more?')
-+        details_url = follow_up.get('details_url', '')
++function setToken(token) {
++  wx.setStorageSync(TOKEN_KEY, token);
++}
 +
-+        if details_url:
-+            response = f"{prompt} More details here: {details_url}"
-+        else:
-+            response = prompt
-+        return response
-diff --git a/self-intro-service/handlers/introduction_handler.py b/self-intro-service/handlers/introduction_handler.py
-new file mode 100644
-index 0000000..ca99613
++function clearToken() {
++  wx.removeStorageSync(TOKEN_KEY);
++}
++
++module.exports = { getToken, setToken, clearToken };
 --- /dev/null
-+++ b/self-intro-service/handlers/introduction_handler.py
-@@ -0,0 +1,71 @@
-+import re
++++ b/miniprogram/utils/request.js
+@@ -0,0 +1,67 @@
++// request.js
++const { API_BASE_URL, ERROR_CODES } = require('./constants');
++const auth = require('./auth');
 +
-+class IntroductionHandler:
-+    """Generates self-introduction responses based on language configuration."""
++const request = (url, options = {}) => {
++  return new Promise((resolve, reject) => {
++    const token = auth.getToken();
++    const header = {
++      'Content-Type': 'application/json',
++    };
++    if (token) {
++      header['Authorization'] = `Bearer ${token}`;
++    }
 +
-+    def __init__(self, config_cache):
-+        self.config_cache = config_cache
++    wx.request({
++      url: `${API_BASE_URL}${url}`,
++      method: options.method || 'GET',
++      data: options.data,
++      header,
++      success: (res) => {
++        if (res.statusCode >= 200 && res.statusCode < 300) {
++          resolve(res);
++        } else if (res.statusCode === 401) {
++          // Token expired or invalid – clear and redirect to login
++          auth.clearToken();
++          wx.showToast({ title: '登录已过期，请重新登录', icon: 'none' });
++          setTimeout(() => {
++            wx.redirectTo({ url: '/pages/login/login' });
++          }, 1500);
++          reject(res);
++        } else if (res.statusCode === 429) {
++          wx.showToast({ title: '请求过于频繁，请稍后重试', icon: 'none' });
++          reject(res);
++        } else {
++          // Other errors
++          const errorMsg = res.data && res.data.message ? res.data.message : '服务器错误';
++          wx.showToast({ title: errorMsg, icon: 'none' });
++          reject(res);
++        }
++      },
++      fail: (err) => {
++        wx.showToast({ title: '网络异常，请检查网络后重试', icon: 'none' });
++        reject(err);
++      }
++    });
++  });
++};
 +
-+    def generate(self, language):
-+        """
-+        Render the introduction template for the given language.
-+        Returns (response_text, follow_up_prompt).
-+        Raises ValueError if config not found.
-+        """
-+        config = self.config_cache.get(language)
-+        if not config:
-+            # Fallback to English
-+            config = self.config_cache.get('en')
-+            if not config:
-+                raise ValueError("No configuration available")
++// Convenience methods
++request.get = (url, data) => request(url, { method: 'GET', data });
++request.post = (url, data) => request(url, { method: 'POST', data });
++request.put = (url, data) => request(url, { method: 'PUT', data });
++request.delete = (url, data) => request(url, { method: 'DELETE', data });
 +
-+        name = config.get('name', 'AI Assistant')
-+        capabilities = config.get('capabilities', '')
-+        limitations = config.get('limitations', '')
-+        tone = config.get('tone', 'friendly')
-+        max_words = config.get('max_words', 100)
-+        follow_up = config.get('follow_up', {})
-+        follow_up_prompt = follow_up.get('prompt', '')
-+
-+        # Build the introduction text according to tone
-+        if language == 'zh':
-+            response = f"你好！我是{name}，一个AI助手。{capabilities}请注意，{limitations}"
-+        else:
-+            # Default English-like
-+            response = f"Hello! I'm {name}, an AI assistant. {capabilities} Please note: {limitations}"
-+
-+        # Enforce word limit
-+        response = self._enforce_word_limit(response, max_words, language)
-+
-+        return response, follow_up_prompt
-+
-+    def _enforce_word_limit(self, text, max_words, language):
-+        """
-+        Truncate text to max_words, preserving last complete sentence.
-+        For Chinese, count characters; for others, words (split by whitespace).
-+        """
-+        if language == 'zh':
-+            # Chinese: count characters
-+            if len(text) <= max_words:
-+                return text
-+            # Find last sentence break before limit
-+            truncated = text[:max_words]
-+            # Ensure we end at a punctuation like 。！？ or cut at char
-+            last_punct = max(truncated.rfind('。'), truncated.rfind('！'), truncated.rfind('？'))
-+            if last_punct > 0:
-+                truncated = truncated[:last_punct+1]
-+            return truncated
-+        else:
-+            # English/other: count words (split)
-+            words = text.split()
-+            if len(words) <= max_words:
-+                return text
-+            # Truncate to first max_words words
-+            truncated = ' '.join(words[:max_words])
-+            # Try to end at the last complete sentence
-+            # Simple: find last period, question mark, exclamation within truncated
-+            last_punct = max(truncated.rfind('.'), truncated.rfind('?'), truncated.rfind('!'))
-+            if last_punct > 0:
-+                # Ensure we don't cut off the rest of the sentence
-+                # We'll keep only up to the last punctuation +1
-+                truncated = truncated[:last_punct+1]
-+            return truncated
-diff --git a/self-intro-service/services/__init__.py b/self-intro-service/services/__init__.py
-new file mode 100644
-index 0000000..e69de29
++module.exports = request;
 --- /dev/null
-+++ b/self-intro-service/services/__init__.py
-@@ -0,0 +1 @@
-+# Empty
-diff --git a/self-intro-service/services/intent_detector.py b/self-intro-service/services/intent_detector.py
-new file mode 100644
-index 0000000..b48482c
---- /dev/null
-+++ b/self-intro-service/services/intent_detector.py
++++ b/miniprogram/pages/login/login.js
 @@ -0,0 +1,61 @@
-+import re
++// pages/login/login.js
++const request = require('../../utils/request');
++const auth = require('../../utils/auth');
 +
-+class IntentDetector:
-+    """
-+    Classifies user input into one of:
-+    - 'introduction': user wants a self-introduction
-+    - 'follow_up': user wants more details after an introduction
-+    - None: other
-+    """
++Page({
++  data: {
++    loading: false,
++    disabled: false
++  },
 +
-+    def __init__(self):
-+        # Compile keyword patterns for performance
-+        self.intro_patterns = [
-+            r'\b(introduce\s+yourself|who\s+are\s+you|what\s+are\s+you)\b',
-+            r'\b(介绍|你是谁|你是什么|自我介绍一下)\b',
-+            r'^请\s*介绍',
-+        ]
-+        self.follow_up_patterns = [
-+            r'\b(more|details|tell\s+me\s+more|learn\s+more)\b',
-+            r'\b(更多|详细|告诉我更多|深入)\b',
-+        ]
++  onLoad() {
++    // Check if already logged in
++    const token = auth.getToken();
++    if (token) {
++      wx.switchTab({ url: '/pages/index/index' });
++    }
++  },
 +
-+        self.intro_re = [re.compile(p, re.IGNORECASE) for p in self.intro_patterns]
-+        self.follow_up_re = [re.compile(p, re.IGNORECASE) for p in self.follow_up_patterns]
++  handleLogin() {
++    if (this.data.disabled) return; // debounce
++    this.setData({ loading: true, disabled: true });
 +
-+    def detect(self, message):
-+        """
-+        Detect intent of the message.
-+        Returns None if not introduction or follow-up.
-+        """
-+        # First check introduction (priority)
-+        for pattern in self.intro_re:
-+            if pattern.search(message):
-+                return 'introduction'
++    wx.showLoading({ title: '登录中…', mask: true });
 +
-+        # Then check follow-up
-+        for pattern in self.follow_up_re:
-+            if pattern.search(message):
-+                return 'follow_up'
++    // Step 1: Get code from WeChat
++    wx.login({
++      success: (res) => {
++        if (res.code) {
++          // Step 2: Send code to backend
++          this.exchangeCode(res.code);
++        } else {
++          wx.hideLoading();
++          wx.showToast({ title: '获取授权失败', icon: 'none' });
++          this.setData({ loading: false, disabled: false });
++        }
++      },
++      fail: () => {
++        wx.hideLoading();
++        wx.showToast({ title: '网络异常', icon: 'none' });
++        this.setData({ loading: false, disabled: false });
++      }
++    });
++  },
 +
-+        return None
-diff --git a/self-intro-service/services/language_detector.py b/self-intro-service/services/language_detector.py
-new file mode 100644
-index 0000000..2ef8c88
++  exchangeCode(code) {
++    request.post('/api/login', { code })
++      .then(res => {
++        const { token, user } = res.data;
++        auth.setToken(token);
++        wx.hideLoading();
++        wx.showToast({ title: '登录成功', icon: 'success' });
++        // Navigate to home page
++        wx.switchTab({ url: '/pages/index/index' });
++      })
++      .catch(err => {
++        wx.hideLoading();
++        const msg = err.data && err.data.message ? err.data.message : '登录失败，请重试';
++        wx.showToast({ title: msg, icon: 'none' });
++        this.setData({ loading: false, disabled: false });
++      });
++  }
++});
 --- /dev/null
-+++ b/self-intro-service/services/language_detector.py
-@@ -0,0 +1,34 @@
-+import re
-+
-+class LanguageDetector:
-+    """
-+    Detect the language of a string.
-+    Fast heuristic: Chinese if contains CJK characters; otherwise English.
-+    For extensibility, fallback to langdetect for other languages.
-+    """
-+
-+    # Unicode range for CJK Unified Ideographs
-+    CJK_PATTERN = re.compile(r'[\u4e00-\u9fff]')
-+
-+    def __init__(self):
-+        # Optionally import langdetect lazily
-+        self._langdetect = None
-+        self.supported_languages = ['zh', 'en', 'fr']  # Add as needed
-+
-+    def detect(self, text):
-+        """Return language code (e.g., 'zh', 'en', 'fr')."""
-+        if self.CJK_PATTERN.search(text):
-+            return 'zh'
-+        # Default to English for now
-+        # For other languages, use langdetect if available
-+        # To keep this implementation lightweight, we only support zh and en.
-+        # If French keywords appear, we can detect via langdetect.
-+        # Check for French hint: accented characters or specific words
-+        if re.search(r'[àâçéèêëîïôûùüÿœ]', text, re.IGNORECASE):
-+            # Attempt langdetect if installed
-+            try:
-+                import langdetect
-+                return langdetect.detect(text)
-+            except:
-+                return 'fr'
-+        return 'en'
-diff --git a/self-intro-service/config/introduction_en.yaml b/self-intro-service/config/introduction_en.yaml
-new file mode 100644
-index 0000000..bbce7e5
++++ b/miniprogram/pages/login/login.wxml
+@@ -0,0 +1,11 @@
++<!-- pages/login/login.wxml -->
++<view class="login-container">
++  <image class="logo" src="/images/logo.png" mode="aspectFit"></image>
++  <text class="title">欢迎使用</text>
++  <text class="subtitle">请授权登录</text>
++  <button 
++    class="login-btn" 
++    type="primary" 
++    loading="{{loading}}" 
++    disabled="{{disabled}}" 
++    bindtap="handleLogin">微信登录</button>
++</view>
 --- /dev/null
-+++ b/self-intro-service/config/introduction_en.yaml
-@@ -0,0 +1,12 @@
-+name: "ChatBot"
-+capabilities: "I can help with language understanding, answering questions, and task assistance."
-+limitations: "I cannot access real-time data or the internet."
-+tone: "friendly and professional"
-+max_words: 100
-+follow_up:
-+  prompt: "Would you like to know more about my features?"
-+  details_url: "/help"
-diff --git a/self-intro-service/config/introduction_zh.yaml b/self-intro-service/config/introduction_zh.yaml
-new file mode 100644
-index 0000000..e2882ae
++++ b/miniprogram/pages/login/login.wxss
+@@ -0,0 +1,42 @@
++/* pages/login/login.wxss */
++.login-container {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  padding-top: 120rpx;
++  background-color: #f8f8f8;
++  min-height: 100vh;
++}
++
++.logo {
++  width: 200rpx;
++  height: 200rpx;
++  border-radius: 20rpx;
++  margin-bottom: 40rpx;
++}
++
++.title {
++  font-size: 40rpx;
++  font-weight: bold;
++  color: #333;
++  margin-bottom: 10rpx;
++}
++
++.subtitle {
++  font-size: 28rpx;
++  color: #999;
++  margin-bottom: 80rpx;
++}
++
++.login-btn {
++  width: 70%;
++  height: 90rpx;
++  line-height: 90rpx;
++  border-radius: 45rpx;
++  font-size: 32rpx;
++  background-color: #07c160;
++}
++
++.login-btn[disabled] {
++  background-color: #a0d8b0;
++}
 --- /dev/null
-+++ b/self-intro-service/config/introduction_zh.yaml
-@@ -0,0 +1,12 @@
-+name: "ChatBot"
-+capabilities: "我可以帮助你理解语言、回答问题以及完成各种任务。"
-+limitations: "我无法访问实时数据或互联网。"
-+tone: "友好且专业"
-+max_words: 100
-+follow_up:
-+  prompt: "你想了解更多关于我的功能吗？"
-+  details_url: "/help"
-diff --git a/self-intro-service/config/introduction_fr.yaml b/self-intro-service/config/introduction_fr.yaml
-new file mode 100644
-index 0000000..b7cb07c
++++ b/miniprogram/pages/index/index.js
+@@ -0,0 +1,28 @@
++// pages/index/index.js
++const auth = require('../../utils/auth');
++const request = require('../../utils/request');
++
++Page({
++  data: {
++    user: null
++  },
++
++  onLoad() {
++    const token = auth.getToken();
++    if (!token) {
++      wx.redirectTo({ url: '/pages/login/login' });
++      return;
++    }
++    request.get('/api/user/me')
++      .then(res => {
++        this.setData({ user: res.data });
++      })
++      .catch(err => {
++        if (err.status === 401) {
++          auth.clearToken();
++          wx.redirectTo({ url: '/pages/login/login' });
++        }
++      });
++  }
++});
 --- /dev/null
-+++ b/self-intro-service/config/introduction_fr.yaml
-@@ -0,0 +1,12 @@
-+name: "ChatBot"
-+capabilities: "Je peux vous aider à comprendre le langage, répondre aux questions et effectuer des tâches."
-+limitations: "Je n'ai pas accès aux données en temps réel ni à Internet."
-+tone: "amical et professionnel"
-+max_words: 100
-+follow_up:
-+  prompt: "Voulez-vous en savoir plus sur mes fonctionnalités ?"
-+  details_url: "/help"
-diff --git a/self-intro-service/tests/__init__.py b/self-intro-service/tests/__init__.py
-new file mode 100644
-index 0000000..e69de29
++++ b/miniprogram/pages/index/index.wxml
+@@ -0,0 +1,13 @@
++<!-- pages/index/index.wxml -->
++<view class="container">
++  <view class="user-card" wx:if="{{user}}">
++    <image class="avatar" src="{{user.avatar_url || '/images/default-avatar.png'}}"></image>
++    <text class="nickname">{{user.nickname || '未设置昵称'}}</text>
++    <text class="login-time">上次登录: {{user.last_login}}</text>
++  </view>
++  <view wx:else>
++    <text>加载中...</text>
++  </view>
++  <button class="logout-btn" bindtap="handleLogout">退出登录</button>
++</view>
++<!-- For brevity, handleLogout logic omitted; would call POST /api/logout -->
 --- /dev/null
-+++ b/self-intro-service/tests/__init__.py
-@@ -0,0 +1 @@
-+# Empty
-diff --git a/self-intro-service/tests/test_intent_detector.py b/self-intro-service/tests/test_intent_detector.py
-new file mode 100644
-index 0000000..ca20f72
++++ b/miniprogram/app.json
+@@ -0,0 +1,20 @@
++{
++  "pages": [
++    "pages/index/index",
++    "pages/login/login"
++  ],
++  "window": {
++    "navigationBarTitleText": "Demo",
++    "navigationBarBackgroundColor": "#ffffff",
++    "navigationBarTextStyle": "black"
++  },
++  "style": "v2",
++  "sitemapLocation": "sitemap.json",
++  "tabBar": {
++    "list": [{
++      "pagePath": "pages/index/index",
++      "text": "首页"
++    }]
++  }
++}
 --- /dev/null
-+++ b/self-intro-service/tests/test_intent_detector.py
-@@ -0,0 +1,49 @@
-+import unittest
-+from services.intent_detector import IntentDetector
-+
-+class TestIntentDetector(unittest.TestCase):
-+    def setUp(self):
-+        self.detector = IntentDetector()
-+
-+    def test_intro_english(self):
-+        self.assertEqual(self.detector.detect("Introduce yourself"), 'introduction')
-+        self.assertEqual(self.detector.detect("Who are you?"), 'introduction')
-+        self.assertEqual(self.detector.detect("What are you?"), 'introduction')
-+
-+    def test_intro_chinese(self):
-+        self.assertEqual(self.detector.detect("介绍一下你自己"), 'introduction')
-+        self.assertEqual(self.detector.detect("你是谁"), 'introduction')
-+        self.assertEqual(self.detector.detect("请你介绍一下"), 'introduction')
-+
-+    def test_follow_up_english(self):
-+        self.assertEqual(self.detector.detect("Tell me more"), 'follow_up')
-+        self.assertEqual(self.detector.detect("more details"), 'follow_up')
-+
-+    def test_follow_up_chinese(self):
-+        self.assertEqual(self.detector.detect("告诉我更多"), 'follow_up')
-+        self.assertEqual(self.detector.detect("详细说说"), 'follow_up')
-+
-+    def test_no_match(self):
-+        self.assertIsNone(self.detector.detect("Hello"))
-+        self.assertIsNone(self.detector.detect("What's the weather?"))
-+        self.assertIsNone(self.detector.detect(""))
-+
-+if __name__ == '__main__':
-+    unittest.main()
-diff --git a/self-intro-service/tests/test_introduction.py b/self-intro-service/tests/test_introduction.py
-new file mode 100644
-index 0000000..f75e967
---- /dev/null
-+++ b/self-intro-service/tests/test_introduction.py
-@@ -0,0 +1,77 @@
-+import unittest
-+import yaml
-+import os
-+from handlers.introduction_handler import IntroductionHandler
-+from handlers.follow_up_handler import FollowUpHandler
-+
-+class TestIntroductionHandler(unittest.TestCase):
-+    def setUp(self):
-+        # Load configs for testing
-+        self.config_cache = {}
-+        config_dir = os.path.join(os.path.dirname(__file__), '..', 'config')
-+        for fname in os.listdir(config_dir):
-+            if fname.startswith('introduction_') and fname.endswith('.yaml'):
-+                lang = fname.replace('introduction_', '').replace('.yaml', '')
-+                with open(os.path.join(config_dir, fname), 'r', encoding='utf-8') as f:
-+                    self.config_cache[lang] = yaml.safe_load(f)
-+        self.intro_handler = IntroductionHandler(self.config_cache)
-+        self.follow_up_handler = FollowUpHandler(self.config_cache)
-+
-+    def test_english_introduction_contains_keywords(self):
-+        response, _ = self.intro_handler.generate('en')
-+        self.assertIn('AI assistant', response)
-+        self.assertIn('can help with', response)
-+        self.assertIn('cannot access real-time', response)
-+        self.assertIn('Hello! I\'m', response)
-+
-+    def test_chinese_introduction_contains_keywords(self):
-+        response, _ = self.intro_handler.generate('zh')
-+        self.assertIn('AI助手', response)
-+        self.assertIn('帮助', response)
-+        self.assertIn('无法访问', response)
-+
-+    def test_french_introduction_contains_keywords(self):
-+        response, _ = self.intro_handler.generate('fr')
-+        self.assertIn('Je peux', response)
-+        self.assertIn('répondre', response)
-+
-+    def test_word_limit_enforced_english(self):
-+        # Ensure response is within word limit
-+        response, _ = self.intro_handler.generate('en')
-+        word_count = len(response.split())
-+        self.assertLessEqual(word_count, 100)
-+
-+    def test_word_limit_enforced_chinese(self):
-+        response, _ = self.intro_handler.generate('zh')
-+        # Chinese: character count
-+        char_count = len(response)
-+        self.assertLessEqual(char_count, 100)
-+
-+    def test_follow_up_handler(self):
-+        response = self.follow_up_handler.generate('en')
-+        self.assertIn('Would you like to know more', response)
-+
-+    def test_follow_up_handler_chinese(self):
-+        response = self.follow_up_handler.generate('zh')
-+        self.assertIn('你想了解更多', response)
-+
-+    def test_consistent_responses(self):
-+        # Multiple calls should return same text
-+        res1, _ = self.intro_handler.generate('en')
-+        res2, _ = self.intro_handler.generate('en')
-+        self.assertEqual(res1, res2)
-+
-+    def test_language_detection_integration(self):
-+        # Use services directly
-+        from services.language_detector import LanguageDetector
-+        detector = LanguageDetector()
-+        self.assertEqual(detector.detect("你好"), 'zh')
-+        self.assertEqual(detector.detect("Hello"), 'en')
-+        self.assertEqual(detector.detect("Bonjour"), 'fr')
-+
-+if __name__ == '__main__':
-+    unittest.main()
-diff --git a/self-intro-service/requirements.txt b/self-intro-service/requirements.txt
-new file mode 100644
-index 0000000..6270cc8
---- /dev/null
-+++ b/self-intro-service/requirements.txt
-@@ -0,0 +1,4 @@
-+flask==2.3.2
-+pyyaml==6.0
-+langdetect==1.0.9
-+# Optional: gunicorn for production
-diff --git a/self-intro-service/Dockerfile b/self-intro-service/Dockerfile
-new file mode 100644
-index 0000000..f63e85f
---- /dev/null
-+++ b/self-intro-service/Dockerfile
++++ b/backend/package.json
 @@ -0,0 +1,16 @@
-+FROM python:3.10-slim
++{
++  "name": "wechat-miniprogram-backend",
++  "version": "1.0.0",
++  "description": "Backend for WeChat Mini-Program login integration",
++  "main": "src/app.js",
++  "scripts": {
++    "start": "node src/app.js",
++    "dev": "nodemon src/app.js"
++  },
++  "dependencies": {
++    "axios": "^1.6.7",
++    "express": "^4.18.2",
++    "jsonwebtoken": "^9.0.2",
++    "mongoose": "^8.1.1",
++    "winston": "^3.11.0",
++    "express-rate-limit": "^7.1.5",
++    "dotenv": "^16.3.1"
++  },
++  "devDependencies": {
++    "nodemon": "^3.0.2"
++  }
++}
+--- /dev/null
++++ b/backend/.env.example
+@@ -0,0 +1,8 @@
++WECHAT_APP_ID=your_appid_here
++WECHAT_APP_SECRET=your_appsecret_here
++JWT_SECRET=your_random_jwt_secret_here
++JWT_EXPIRES_IN=7d
++MONGO_URI=mongodb://localhost:27017/wechat_miniprogram
++PORT=3000
++REDIS_URL=redis://localhost:6379 # optional
++ENCRYPTION_KEY=32_byte_random_key_for_session_key_encryption
+--- /dev/null
++++ b/backend/src/app.js
+@@ -0,0 +1,47 @@
++const express = require('express');
++const mongoose = require('mongoose');
++const dotenv = require('dotenv');
++const { logger } = require('./logger');
++const errorHandler = require('./middleware/errorHandler');
++const authRoutes = require('./routes/auth.routes');
++const userRoutes = require('./routes/user.routes');
 +
++dotenv.config();
++
++const app = express();
++
++// Middleware
++app.use(express.json());
++app.use(require('./middleware/rateLimit'));
++app.use(require('./middleware/logger'));
++
++// Routes
++app.use('/api', authRoutes);
++app.use('/api', userRoutes);
++app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
++
++// Global error handler
++app.use(errorHandler);
++
++// Database connection
++mongoose.connect(process.env.MONGO_URI)
++  .then(() => {
++    logger.info('Connected to MongoDB');
++  })
++  .catch(err => {
++    logger.error('MongoDB connection error', { error: err.message });
++    process.exit(1);
++  });
++
++const PORT = process.env.PORT || 3000;
++app.listen(PORT, () => {
++  logger.info(`Server running on port ${PORT}`);
++});
++
++module.exports = app;
+--- /dev/null
++++ b/backend/src/config/index.js
+@@ -0,0 +1,24 @@
++const dotenv = require('dotenv');
++dotenv.config();
++
++module.exports = {
++  wechat: {
++    appId: process.env.WECHAT_APP_ID,
++    appSecret: process.env.WECHAT_APP_SECRET,
++    jscode2sessionUrl: 'https://api.weixin.qq.com/sns/jscode2session'
++  },
++  jwt: {
++    secret: process.env.JWT_SECRET,
++    expiresIn: process.env.JWT_EXPIRES_IN || '7d'
++  },
++  db: {
++    uri: process.env.MONGO_URI
++  },
++  encryption: {
++    key: process.env.ENCRYPTION_KEY // 32 bytes for AES-256
++  },
++  rateLimit: {
++    windowMs: 60 * 1000, // 1 minute
++    max: 10 // 10 requests per window per IP
++  }
++};
+--- /dev/null
++++ b/backend/src/logger/index.js
+@@ -0,0 +1,24 @@
++const winston = require('winston');
++
++const logger = winston.createLogger({
++  level: 'info',
++  format: winston.format.json(),
++  defaultMeta: { service: 'wechat-backend' },
++  transports: [
++    new winston.transports.Console({
++      format: winston.format.combine(
++        winston.format.colorize(),
++        winston.format.simple()
++      )
++    }),
++    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
++    new winston.transports.File({ filename: 'logs/combined.log' })
++  ]
++});
++
++// Middleware for logging requests
++const requestLogger = (req, res, next) => {
++  logger.info('Request', { method: req.method, url: req.url, ip: req.ip });
++  next();
++};
++module.exports = { logger, requestLogger };
+--- /dev/null
++++ b/backend/src/middleware/logger.js
+@@ -0,0 +1,7 @@
++const { requestLogger } = require('../logger');
++
++module.exports = (req, res, next) => {
++  // Structured logging with masked sensitive fields
++  const logData = { method: req.method, url: req.url, ip: req.ip, body: maskSensitive(req.body) };
++  // For brevity, we use a simple console as placeholder
++  next();
++};
++function maskSensitive(body) {
++  if (!body) return body;
++  const masked = { ...body };
++  if (masked.code) masked.code = masked.code.substring(0, 4) + '****';
++  return masked;
++}
+--- /dev/null
++++ b/backend/src/middleware/auth.js
+@@ -0,0 +1,22 @@
++const jwt = require('jsonwebtoken');
++const config = require('../config');
++const { tokenBlacklist } = require('../services/token.service');
++
++module.exports = (req, res, next) => {
++  const authHeader = req.headers.authorization;
++  if (!authHeader || !authHeader.startsWith('Bearer ')) {
++    return res.status(401).json({ error: 'unauthorized', message: '缺少认证令牌' });
++  }
++  const token = authHeader.split(' ')[1];
++
++  // Check blacklist (if any)
++  if (tokenBlacklist.has(token)) {
++    return res.status(401).json({ error: 'token_expired', message: '令牌已失效' });
++  }
++
++  jwt.verify(token, config.jwt.secret, (err, decoded) => {
++    if (err) return res.status(401).json({ error: 'invalid_token', message: '令牌无效或已过期' });
++    req.userId = decoded.sub;
++    next();
++  });
++};
+--- /dev/null
++++ b/backend/src/middleware/rateLimit.js
+@@ -0,0 +1,13 @@
++const rateLimit = require('express-rate-limit');
++const config = require('../config');
++
++const loginLimiter = rateLimit({
++  windowMs: config.rateLimit.windowMs,
++  max: config.rateLimit.max,
++  message: {
++    error: 'rate_limited',
++    message: '请求过于频繁，请稍后重试'
++  }
++});
++
++module.exports = loginLimiter;
+--- /dev/null
++++ b/backend/src/middleware/errorHandler.js
+@@ -0,0 +1,15 @@
++const { logger } = require('../logger');
++
++module.exports = (err, req, res, next) => {
++  logger.error('Unhandled error', { error: err.message, stack: err.stack });
++
++  const statusCode = err.statusCode || 500;
++  const errorCode = err.errorCode || 'server_error';
++  const message = err.message || '服务器内部错误';
++
++  res.status(statusCode).json({
++    error: errorCode,
++    message
++  });
++};
+--- /dev/null
++++ b/backend/src/routes/auth.routes.js
+@@ -0,0 +1,11 @@
++const express = require('express');
++const router = express.Router();
++const authController = require('../controllers/auth.controller');
++const authMiddleware = require('../middleware/auth');
++const loginLimiter = require('../middleware/rateLimit');
++
++router.post('/login', loginLimiter, authController.handleLogin);
++router.post('/logout', authMiddleware, authController.handleLogout);
++
++module.exports = router;
+--- /dev/null
++++ b/backend/src/routes/user.routes.js
+@@ -0,0 +1,9 @@
++const express = require('express');
++const router = express.Router();
++const userController = require('../controllers/user.controller');
++const authMiddleware = require('../middleware/auth');
++
++router.get('/user/me', authMiddleware, userController.getProfile);
++
++module.exports = router;
+--- /dev/null
++++ b/backend/src/controllers/auth.controller.js
+@@ ... @@
++const wechatService = require('../services/wechat.service');
++const tokenService = require('../services/token.service');
++const userService = require('../services/user.service');
++const { ValidationError } = require('../utils/errors');
++
++exports.handleLogin = async (req, res, next) => {
++  try {
++    const { code } = req.body;
++    if (!code) {
++      throw new ValidationError('缺少授权码', 'invalid_code');
++    }
++
++    // Call WeChat API to get openid and session_key
++    const wechatResult = await wechatService.code2Session(code);
++    const { openid, unionid, session_key } = wechatResult;
++
++    // Find or create user
++    const user = await userService.findOrCreate(openid, unionid, session_key);
++
++    // Generate JWT
++    const token = tokenService.generateToken(user.id);
++
++    res.json({
++      token,
++      user: {
++        id: user.id,
++        openid: user.openid,  // Typically should not expose; but for demo
++        unionid: user.unionid,
++        nickname: user.nickname,
++        avatar_url: user.avatar_url,
++        is_new_user: user.first_login === user.last_login // if first_login equals last_login, it's new
++      },
++      expires_in: tokenService.getExpiresInSeconds()
++    });
++  } catch (err) {
++    next(err);
++  }
++};
++
++exports.handleLogout = async (req, res, next) => {
++  try {
++    const token = req.headers.authorization.split(' ')[1];
++    tokenService.blacklistToken(token);
++    res.json({ message: 'logged_out' });
++  } catch (err) {
++    next(err);
++  }
++};
+--- /dev/null
++++ b/backend/src/controllers/user.controller.js
+@@ -0,0 +1,20 @@
++const userService = require('../services/user.service');
++
++exports.getProfile = async (req, res, next) => {
++  try {
++    const userId = req.userId;
++    const user = await userService.findById(userId);
++    if (!user) {
++      return res.status(404).json({ error: 'user_not_found', message: '用户不存在' });
++    }
++    res.json({
++      id: user.id,
++      openid: user.openid,  // Consider omitting for privacy
++      nickname: user.nickname,
++      avatar_url: user.avatar_url,
++      created_at: user.created_at,
++      last_login: user.last_login
++    });
++  } catch (err) {
++    next(err);
++  }
++};
+--- /dev/null
++++ b/backend/src/services/wechat.service.js
+@@ -0,0 +1,42 @@
++const axios = require('axios');
++const config = require('../config');
++const { ExternalServiceError, ValidationError } = require('../utils/errors');
++const { logger } = require('../logger');
++
++exports.code2Session = async (code) => {
++  try {
++    const response = await axios.get(config.wechat.jscode2sessionUrl, {
++      params: {
++        appid: config.wechat.appId,
++        secret: config.wechat.appSecret,
++        js_code: code,
++        grant_type: 'authorization_code'
++      },
++      timeout: 5000
++    });
++
++    const data = response.data;
++
++    // Check WeChat error
++    if (data.errcode && data.errcode !== 0) {
++      logger.error('WeChat API error', { errcode: data.errcode, errmsg: data.errmsg });
++      // Map common errors
++      if (data.errcode === 40029) {
++        throw new ValidationError('授权码无效或已过期', 'invalid_code');
++      } else if (data.errcode === 45011) {
++        throw new ValidationError('API 频率超限', 'rate_limited');
++      } else {
++        throw new ExternalServiceError('微信服务异常', 'wechat_error');
++      }
++    }
++
++    if (!data.openid) {
++      throw new ExternalServiceError('微信返回缺失 openid', 'wechat_error');
++    }
++
++    // Return openid, unionid (if any), session_key
++    return { openid: data.openid, unionid: data.unionid || null, session_key: data.session_key };
++  } catch (err) {
++    if (err.isCustom) throw err;
++    throw new ExternalServiceError('微信服务不可达', 'wechat_unreachable');
++  }
++};
+--- /dev/null
++++ b/backend/src/services/token.service.js
+@@ ... @@
++const jwt = require('jsonwebtoken');
++const config = require('../config');
++
++// Simple in-memory blacklist (for production use Redis)
++const tokenBlacklist = new Set();
++
++exports.generateToken = (userId) => {
++  return jwt.sign(
++    { sub: userId },
++    config.jwt.secret,
++    { expiresIn: config.jwt.expiresIn }
++  );
++};
++
++exports.verifyToken = (token) => {
++  return jwt.verify(token, config.jwt.secret);
++};
++
++exports.blacklistToken = (token) => {
++  tokenBlacklist.add(token);
++  // For production, set TTL based on remaining token expiry
++};
++
++exports.getExpiresInSeconds = () => {
++  // Parse expiresIn string to seconds
++  const match = config.jwt.expiresIn.match(/^(\d+)(d|h|m|s)?$/);
++  if (!match) return 604800; // default 7 days
++  const value = parseInt(match[1]);
++  const unit = match[2] || 'd';
++  const multipliers = { d: 86400, h: 3600, m: 60, s: 1 };
++  return value * (multipliers[unit] || 86400);
++};
++
++exports.tokenBlacklist = tokenBlacklist;
+--- /dev/null
++++ b/backend/src/services/user.service.js
+@@ -0,0 +1,49 @@
++const userRepository = require('../repositories/user.repository');
++const crypto = require('../utils/crypto');
++const { logger } = require('../logger');
++
++exports.findOrCreate = async (openid, unionid, sessionKey) => {
++  let user = await userRepository.findByOpenid(openid);
++  const now = new Date();
++
++  if (!user) {
++    // New user
++    const encryptedSessionKey = crypto.encrypt(sessionKey);
++    user = await userRepository.create({
++      openid,
++      unionid: unionid || undefined,
++      encrypted_session_key: encryptedSessionKey,
++      first_login: now,
++      last_login: now
++    });
++    logger.info('New user created', { openid: maskOpenid(openid) });
++  } else {
++    // Existing user: update login time and unionid if missing
++    const updateData = { last_login: now };
++    if (unionid && !user.unionid) {
++      updateData.unionid = unionid;
++    }
++    // Optionally re-encrypt session_key if needed
++    // For now we do not store updated session_key (WeChat session_key may change)
++    user = await userRepository.update(user.id, updateData);
++    logger.info('User login updated', { openid: maskOpenid(openid) });
++  }
++  return user;
++};
++
++exports.findById = async (id) => {
++  return userRepository.findById(id);
++};
++
++exports.updateProfile = async (id, profileData) => {
++  // For setting nickname, avatar after obtaining from WeChat userinfo (not covered here)
++  return userRepository.update(id, profileData);
++};
++
++function maskOpenid(openid) {
++  if (!openid) return 'unknown';
++  return openid.substring(0, 4) + '****';
++}
++
++// Export for repository
++exports.maskOpenid = maskOpenid;
+--- /dev/null
++++ b/backend/src/repositories/user.repository.js
+@@ -0,0 +1,42 @@
++const User = require('../models/user.model');
++
++exports.findByOpenid = async (openid) => {
++  try {
++    return await User.findOne({ openid });
++  } catch (err) {
++    throw err;
++  }
++};
++
++exports.findById = async (id) => {
++  try {
++    return await User.findById(id);
++  } catch (err) {
++    throw err;
++  }
++};
++
++exports.create = async (userData) => {
++  try {
++    const user = new User(userData);
++    return await user.save();
++  } catch (err) {
++    throw err;
++  }
++};
++
++exports.update = async (id, updateData) => {
++  try {
++    return await User.findByIdAndUpdate(id, updateData, { new: true });
++  } catch (err) {
++    throw err;
++  }
++};
++
++exports.delete = async (id) => {
++  try {
++    return await User.findByIdAndDelete(id);
++  } catch (err) {
++    throw err;
++  }
++};
+--- /dev/null
++++ b/backend/src/models/user.model.js
+@@ -0,0 +1,31 @@
++const mongoose = require('mongoose');
++
++const userSchema = new mongoose.Schema({
++  openid: {
++    type: String,
++    required: true,
++    unique: true,
++    index: true
++  },
++  unionid: {
++    type: String,
++    default: null
++  },
++  encrypted_session_key: {
++    type: Buffer,
++    default: null
++  },
++  nickname: String,
++  avatar_url: String,
++  first_login: { type: Date, default: Date.now },
++  last_login: { type: Date, default: Date.now },
++  created_at: { type: Date, default: Date.now },
++  updated_at: { type: Date, default: Date.now }
++});
++
++userSchema.pre('save', function(next) {
++  this.updated_at = Date.now();
++  next();
++});
++
++module.exports = mongoose.model('User', userSchema);
+--- /dev/null
++++ b/backend/src/utils/crypto.js
+@@ -0,0 +1,28 @@
++const crypto = require('crypto');
++const config = require('../config');
++
++const ALGORITHM = 'aes-256-cbc';
++const IV_LENGTH = 16;
++
++function encrypt(text) {
++  const key = Buffer.from(config.encryption.key, 'hex');
++  const iv = crypto.randomBytes(IV_LENGTH);
++  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
++  let encrypted = cipher.update(text, 'utf8', 'hex');
++  encrypted += cipher.final('hex');
++  return iv.toString('hex') + ':' + encrypted;
++}
++
++function decrypt(encryptedText) {
++  const key = Buffer.from(config.encryption.key, 'hex');
++  const parts = encryptedText.split(':');
++  const iv = Buffer.from(parts.shift(), 'hex');
++  const encrypted = parts.join(':');
++  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
++  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
++  decrypted += decipher.final('utf8');
++  return decrypted;
++}
++
++module.exports = { encrypt, decrypt };
+--- /dev/null
++++ b/backend/src/utils/errors.js
+@@ -0,0 +1,24 @@
++class CustomError extends Error {
++  constructor(message, errorCode, statusCode = 500) {
++    super(message);
++    this.name = this.constructor.name;
++    this.errorCode = errorCode;
++    this.statusCode = statusCode;
++    this.isCustom = true;
++  }
++}
++
++class ValidationError extends CustomError {
++  constructor(message, errorCode = 'validation_error', statusCode = 400) {
++    super(message, errorCode, statusCode);
++  }
++}
++
++class ExternalServiceError extends CustomError {
++  constructor(message, errorCode = 'external_error', statusCode = 502) {
++    super(message, errorCode, statusCode);
++  }
++}
++
++module.exports = { CustomError, ValidationError, ExternalServiceError };
+--- /dev/null
++++ b/backend/Dockerfile
+@@ -0,0 +1,15 @@
++FROM node:18-alpine
 +WORKDIR /app
-+
-+COPY requirements.txt .
-+RUN pip install --no-cache-dir -r requirements.txt
-+
++COPY package*.json ./
++RUN npm install --production
 +COPY . .
++EXPOSE 3000
++CMD ["node", "src/app.js"]
++```
 +
-+# Expose the port the app runs on
-+EXPOSE 5000
-+
-+# Use gunicorn for production with 2 workers
-+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "main:app"]
-+
-+# For development, replace with: CMD ["python", "main.py"]
-```
++**Note:** 
++- The above diff assumes an empty repository and creates all files. It covers the core components: frontend login page, token management, HTTP request wrapper; backend Express server with JWT, WeChat code exchange, user management, encryption, rate limiting, error handling.
++- Omitted files for brevity include the `login.json`, `index.json`, full `index.wxss`, `index.js` logout logic, `sitemap.json`, `app.wxss`, and some utility functions (e.g., Redis integration). These can be added following the same pattern.
++- Environment variables must be set in a `.env` file (copy from `.env.example`).
+- The MongoDB model uses Mongoose; adapt schema for PostgreSQL if needed.

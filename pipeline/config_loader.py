@@ -70,10 +70,7 @@ def resolve_model_config(config: PipelineConfig) -> PipelineConfig:
     if model := os.environ.get("DEEPSEEK_MODEL", ""):
         config.model_name = model
 
-    if config.api_key:
-        return config
-
-    # 2. Fall back to config/model.json
+    # Fall back to config/model.json
     model_json_path = Path(__file__).parent.parent / "config" / "model.json"
     if model_json_path.exists():
         with open(model_json_path, encoding="utf-8") as f:

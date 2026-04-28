@@ -11,8 +11,6 @@ import json
 import logging
 from pathlib import Path
 
-from langchain.chains import SequentialChain
-
 from pipeline.callbacks import PipelineCallbackHandler
 from pipeline.models import PipelineConfig, PipelineState, StageInput, StageOutput
 from chains import (

@@ -1,396 +1,410 @@
-Below are the pytest unit and integration tests covering the self‑introduction service as described. They verify each component (intent detection, language detection, introduction rendering, follow‑up handling) and the full `/api/introduction` endpoint, including edge cases and error conditions.
+Below are **pytest** unit and integration tests for a Python backend implementing the WeChat Mini‑Program login flow described in the specification.  
+The tests assume a Flask/FastAPI or similar Python web framework, with services, repositories, and middleware structured as in the provided design.  
+All tests use mocking for external APIs and databases where appropriate.
 
 ---
+
+## Test Strategy
+
+| Test Type        | Scope                                             | Dependencies Mocked / Used                                   |
+|------------------|---------------------------------------------------|--------------------------------------------------------------|
+| **Unit Tests**   | Individual services, helpers, middleware          | `requests`, `jwt`, database calls, Redis, logger             |
+| **Integration Tests** | Full API endpoints with a test database        | Test DB (SQLite in‑memory), mocked WeChat API, Redis (optional) |
+| **Security**     | JWT validation, rate‑limiting, PII in logs       | Real JWT signing, mocked time                                |
+
+---
+
+## 1. Unit Tests
+
+### 1.1 WeChatService – `jscode2session`
+
+```python
+# tests/unit/test_wechat_service.py
+import pytest
+from unittest.mock import patch, MagicMock
+from app.services.wechat_service import WeChatService
+from app.config import Settings
+import requests
+
+@pytest.fixture
+def wechat_service():
+    settings = Settings(
+        WECHAT_APPID="test_appid",
+        WECHAT_SECRET="test_secret",
+        WECHAT_API_URL="https://api.weixin.qq.com/sns/jscode2session"
+    )
+    return WeChatService(settings)
+
+@patch("app.services.wechat_service.requests.get")
+def test_jscode2session_success(mock_get, wechat_service):
+    """Verify successful code exchange returns openid and session_key."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {
+        "openid": "oTestOpenId",
+        "session_key": "testSessionKey",
+        "unionid": "unionid_test"
+    }
+    mock_response.raise_for_status.return_value = None
+    mock_get.return_value = mock_response
+
+    result = wechat_service.jscode2session("valid_code")
+
+    assert result["openid"] == "oTestOpenId"
+    assert result["session_key"] == "testSessionKey"
+    assert result["unionid"] == "unionid_test"
+    mock_get.assert_called_once()
+
+@patch("app.services.wechat_service.requests.get")
+def test_jscode2session_invalid_code(mock_get, wechat_service):
+    """Verify that WeChat API error raises a custom exception."""
+    mock_response = MagicMock()
+    mock_response.json.return_value = {"errcode": 40029, "errmsg": "invalid code"}
+    mock_response.raise_for_status.return_value = None
+    mock_get.return_value = mock_response
+
+    with pytest.raises(WeChatAPIError) as exc:
+        wechat_service.jscode2session("bad_code")
+    assert "invalid_code" in str(exc.value)
+
+@patch("app.services.wechat_service.requests.get")
+def test_jscode2session_network_failure(mock_get, wechat_service):
+    """Verify that a request exception is propagated."""
+    mock_get.side_effect = requests.exceptions.ConnectionError("No connection")
+    with pytest.raises(WeChatServiceUnavailable) as exc:
+        wechat_service.jscode2session("code")
+    assert "server_error" in str(exc.value)
+
+def test_mask_code(wechat_service):
+    """Ensure code is masked for logging (first 4 chars + ****)."""
+    masked = wechat_service.mask_code("abcdefghij")
+    assert masked == "abcd******"
+```
+
+### 1.2 TokenService – JWT generation / verification / blacklist
+
+```python
+# tests/unit/test_token_service.py
+import pytest
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+from app.services.token_service import TokenService
+from app.config import Settings
+
+@pytest.fixture
+def token_service():
+    settings = Settings(
+        JWT_SECRET="test_secret_key",
+        JWT_ALGORITHM="HS256",
+        JWT_EXPIRATION_SECONDS=604800,  # 7 days
+    )
+    redis_client = MagicMock()  # Mock Redis for blacklist
+    return TokenService(settings, redis_client)
+
+def test_generate_token_validity(token_service):
+    """Verify that generated token contains correct sub and iat/exp."""
+    user_id = "123e4567-e89b-12d3-a456-426614174000"
+    token = token_service.generate_token(user_id)
+    payload = token_service.decode_token(token)
+
+    assert payload["sub"] == user_id
+    assert "iat" in payload
+    assert "exp" in payload
+    # Check expiration is roughly 7 days ahead
+    exp_time = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
+    assert (exp_time - datetime.now(timezone.utc)).days == 6  # within 7 days
+
+def test_verify_valid_token(token_service):
+    """Verify that a valid token passes verification and returns sub."""
+    user_id = "user123"
+    token = token_service.generate_token(user_id)
+    result = token_service.verify_token(token)
+    assert result == user_id
+
+def test_verify_expired_token(token_service):
+    """Verify that an expired token raises TokenExpiredError."""
+    with patch("app.services.token_service.datetime") as mock_dt:
+        # Simulate token created 8 days ago
+        past = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        mock_dt.now.return_value = past
+        expired_token = token_service.generate_token("user123")
+
+        # Now move time forward
+        mock_dt.now.return_value = past + timedelta(days=8)
+        mock_dt.fromtimestamp = datetime.fromtimestamp
+        mock_dt.utcfromtimestamp = datetime.utcfromtimestamp  # if Python <3.11
+
+        with pytest.raises(TokenExpiredError):
+            token_service.verify_token(expired_token)
+
+def test_blacklisted_token_is_rejected(token_service):
+    """Verify that tokens added to blacklist are invalidated."""
+    token = token_service.generate_token("user123")
+    token_service.blacklist_token(token, ttl=3600)
+    with pytest.raises(TokenBlacklistedError):
+        token_service.verify_token(token)
+
+def test_logout_invalidates_token(token_service):
+    """Blacklist token upon logout."""
+    token = token_service.generate_token("user123")
+    token_service.blacklist_token(token, ttl=3600)
+    assert token_service.redis_client.setex.called
+```
+
+### 1.3 UserService – `find_or_create`
+
+```python
+# tests/unit/test_user_service.py
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+from app.services.user_service import UserService
+from app.repositories.user_repository import UserRepository
+from app.models.user import User
+
+@pytest.fixture
+def user_repo():
+    return MagicMock(spec=UserRepository)
+
+@pytest.fixture
+def user_service(user_repo):
+    return UserService(repository=user_repo)
+
+@pytest.mark.asyncio
+async def test_find_or_create_user_new(user_service, user_repo):
+    """When user does not exist, create a new record."""
+    openid = "new_openid"
+    unionid = "unionid_new"
+    session_key = "key"
+
+    user_repo.find_by_openid.return_value = None  # user not found
+    new_user = User(id="new_id", openid=openid, unionid=unionid,
+                    first_login=datetime.now())
+    user_repo.create.return_value = new_user
+
+    result = await user_service.find_or_create(openid, unionid, session_key)
+    assert result.id == "new_id"
+    assert result.is_new is True
+    user_repo.create.assert_called_once_with(openid=openid, unionid=unionid,
+                                             session_key=session_key)
+
+@pytest.mark.asyncio
+async def test_find_or_create_user_existing(user_service, user_repo):
+    """When user exists, update last_login and return existing."""
+    existing_user = User(id="existing_id", openid="existing_openid",
+                         last_login=datetime(2023,1,1))
+    user_repo.find_by_openid.return_value = existing_user
+    user_repo.save = MagicMock()
+
+    result = await user_service.find_or_create("existing_openid", None, None)
+    assert result.id == "existing_id"
+    assert result.is_new is False
+    user_repo.save.assert_called_once()
+    # last_login should be updated to now
+    assert result.last_login > datetime(2023,1,1)
+```
+
+### 1.4 Error Handling & Logging
+
+```python
+# tests/unit/test_error_handler.py
+from app.middleware.error_handler import error_handler
+from app.utils.errors import WeChatAPIError, TokenExpiredError
+import json
+
+def test_wechat_api_error_formats_response():
+    """Verify that WeChatAPIError returns proper JSON with error code."""
+    exc = WeChatAPIError("invalid_code", "登录已过期，请重新授权")
+    response, status = error_handler(exc)
+    assert status == 400
+    body = json.loads(response.data)
+    assert body["error"] == "invalid_code"
+    assert body["message"] == "登录已过期，请重新授权"
+```
+
+---
+
+## 2. Integration Tests
+
+### 2.1 Test Configuration & Fixtures
 
 ```python
 # tests/conftest.py
 import pytest
-from unittest.mock import Mock, patch
-import yaml
-from fastapi.testclient import TestClient
-from main import app  # assume FastAPI app in main.py
+from flask import Flask
+from app import create_app
+from app.config import TestingConfig
+from app.models.user import User, db
+from app.models.user import User as UserModel
+import os
 
-# Sample configs for testing
-SAMPLE_CONFIG_EN = {
-    "name": "ChatBot",
-    "capabilities": "I can help with language understanding, answering questions, and task assistance.",
-    "limitations": "I cannot access real-time data or the internet.",
-    "tone": "friendly and professional",
-    "max_words": 100,
-    "follow_up": {
-        "prompt": "Would you like to know more about my features?",
-        "details_url": "/help"
-    }
-}
-
-SAMPLE_CONFIG_ZH = {
-    "name": "ChatBot",
-    "capabilities": "我可以帮助你理解语言、回答问题以及完成各种任务。",
-    "limitations": "我无法访问实时数据或互联网。",
-    "tone": "友好且专业",
-    "max_words": 100,
-    "follow_up": {
-        "prompt": "你想了解更多关于我的功能吗？",
-        "details_url": "/help"
-    }
-}
-
-SAMPLE_CONFIG_FR = {
-    "name": "ChatBot",
-    "capabilities": "Je peux vous aider à comprendre le langage, répondre aux questions et effectuer des tâches.",
-    "limitations": "Je ne peux pas accéder aux données en temps réel ni à Internet.",
-    "tone": "amical et professionnel",
-    "max_words": 100,
-    "follow_up": {
-        "prompt": "Souhaitez-vous en savoir plus sur mes fonctionnalités?",
-        "details_url": "/aide"
-    }
-}
+@pytest.fixture(scope="module")
+def app():
+    app = create_app(config_class=TestingConfig)
+    with app.app_context():
+        db.create_all()
+        yield app
+        db.session.remove()
+        db.drop_all()
 
 @pytest.fixture
-def client():
-    """FastAPI test client."""
-    return TestClient(app)
+def client(app):
+    with app.test_client() as client:
+        with app.app_context():
+            db.session.begin_nested()  # rollback after each test
+            yield client
+            db.session.rollback()
 
 @pytest.fixture
-def mock_config_loader():
-    """Mock loading of YAML configs."""
-    def _mock_load(language):
-        configs = {"en": SAMPLE_CONFIG_EN, "zh": SAMPLE_CONFIG_ZH, "fr": SAMPLE_CONFIG_FR}
-        return configs.get(language, None)
-    return _mock_load
-
-@pytest.fixture
-def mock_intent_detector():
-    """Fixture to mock intent detector."""
-    with patch("services.intent_detector.IntentDetector") as mock:
-        detector = mock.return_value
-        # Default: classify as initial intro
-        detector.classify.return_value = "initial_intro"
-        yield detector
-
-@pytest.fixture
-def mock_language_detector():
-    """Fixture to mock language detector."""
-    with patch("services.language_detector.LanguageDetector") as mock:
-        detector = mock.return_value
-        detector.detect.return_value = "en"
-        yield detector
+def mock_wechat_api(monkeypatch):
+    """Override WeChatService to return a fixed response."""
+    def mock_jscode2session(code):
+        if code == "valid_code":
+            return {"openid": "integration_test_openid",
+                    "session_key": "fake_key",
+                    "unionid": None}
+        elif code == "invalid_code":
+            raise WeChatAPIError("invalid_code", "bad code")
+        else:
+            raise WeChatAPIError("server_error", "WeChat server down")
+    monkeypatch.setattr("app.services.wechat_service.WeChatService.jscode2session",
+                        mock_jscode2session)
 ```
 
----
+### 2.2 POST /api/login
 
 ```python
-# tests/test_intent_detector.py
-import pytest
-from unittest.mock import patch
-from services.intent_detector import IntentDetector
+# tests/integration/test_auth_login.py
 
-# We assume IntentDetector has a method classify(message) -> str
-# Possible returns: "initial_intro", "follow_up", "other"
+class TestLogin:
+    def test_successful_login(self, client, mock_wechat_api):
+        """Verify that a valid code returns token and user."""
+        response = client.post("/api/login", json={"code": "valid_code"})
+        assert response.status_code == 200
+        data = response.get_json()
+        assert "token" in data
+        assert "user" in data
+        assert data["user"]["is_new_user"] is True
+        # Check token is JWT
+        import jwt
+        payload = jwt.decode(data["token"], options={"verify_signature": False})
+        assert payload["sub"] == data["user"]["id"]
 
-@pytest.mark.unit
-class TestIntentDetector:
-    """Unit tests for IntentDetector."""
-
-    def setup_method(self):
-        self.detector = IntentDetector()
-
-    @patch("services.intent_detector.load_keywords")
-    def test_initial_intro_chinese(self, mock_keywords):
-        """AC-07: Chinese 'introduce yourself' triggers initial_intro."""
-        mock_keywords.return_value = {"initial": ["介绍", "你是谁", "自我介绍"]}
-        result = self.detector.classify("请你介绍一下你自己")
-        assert result == "initial_intro"
-
-    @patch("services.intent_detector.load_keywords")
-    def test_follow_up_english(self, mock_keywords):
-        """AC-07: 'tell me more' triggers follow_up."""
-        mock_keywords.return_value = {"follow_up": ["more", "tell me more", "details"]}
-        result = self.detector.classify("tell me more")
-        assert result == "follow_up"
-
-    @patch("services.intent_detector.load_keywords")
-    def test_non_intro_message(self, mock_keywords):
-        """Random message triggers 'other'."""
-        mock_keywords.return_value = {"initial": ["介绍"], "follow_up": ["more"]}
-        result = self.detector.classify("What is the weather?")
-        assert result == "other"
-
-    @patch("services.intent_detector.load_keywords")
-    def test_empty_message(self, mock_keywords):
-        """Empty message returns 'other' (not an error)."""
-        mock_keywords.return_value = {"initial": [], "follow_up": []}
-        result = self.detector.classify("")
-        assert result == "other"
-```
-
----
-
-```python
-# tests/test_language_detector.py
-import pytest
-from services.language_detector import LanguageDetector
-
-# Assume detect(message) -> str (language code)
-
-@pytest.mark.unit
-class TestLanguageDetector:
-    """Unit tests for LanguageDetector."""
-
-    def setup_method(self):
-        self.detector = LanguageDetector()
-
-    def test_detect_chinese(self):
-        """CJK characters → 'zh'."""
-        result = self.detector.detect("请你介绍一下你自己")
-        assert result == "zh"
-
-    def test_detect_english(self):
-        """ASCII without CJK → 'en'."""
-        result = self.detector.detect("Please introduce yourself")
-        assert result == "en"
-
-    def test_detect_french(self):
-        """French text (Latin with accents) → 'fr' using langdetect fallback."""
-        # Assume langdetect works; we can simulate with a mock if needed
-        result = self.detector.detect("Présentez-vous, s'il vous plaît")
-        assert result == "fr"
-
-    def test_detect_empty_message(self):
-        """Empty string → default 'en'."""
-        result = self.detector.detect("")
-        assert result == "en"
-
-    def test_detect_mixed_languages(self):
-        """Mixed Chinese and English → prefer Chinese (first CJK)."""
-        result = self.detector.detect("Hello 世界")
-        assert result == "zh"
-```
-
----
-
-```python
-# tests/test_introduction_handler.py
-import pytest
-from unittest.mock import patch, MagicMock
-from handlers.introduction_handler import IntroductionHandler
-from config.loader import ConfigLoader  # assume exists
-
-@pytest.mark.unit
-class TestIntroductionHandler:
-    """Unit tests for IntroductionHandler (intro rendering)."""
-
-    def setup_method(self):
-        self.handler = IntroductionHandler()
-
-    @patch.object(ConfigLoader, "get_config")
-    def test_render_introduction_english(self, mock_get_config):
-        """Verify template placeholders are replaced correctly."""
-        config = {
-            "name": "ChatBot",
-            "capabilities": "I can help with language understanding.",
-            "limitations": "I cannot access real-time data.",
-            "max_words": 100,
-            "follow_up": {}
-        }
-        mock_get_config.return_value = config
-        rendered = self.handler.render_introduction("en")
-        expected = "I am ChatBot, an AI assistant. I can help with language understanding. Please note, I cannot access real-time data."
-        assert rendered == expected
-
-    @patch.object(ConfigLoader, "get_config")
-    def test_word_count_truncation(self, mock_get_config):
-        """Words > max_words should be truncated to last complete sentence under limit."""
-        config = {
-            "name": "ChatBot",
-            "capabilities": "A " * 50,   # 50 words
-            "limitations": "B " * 60,   # 60 words
-            "max_words": 100,           # total would be >100
-            "follow_up": {}
-        }
-        mock_get_config.return_value = config
-        rendered = self.handler.render_introduction("en")
-        word_count = len(rendered.split())
-        assert word_count <= 100
-        # Ensure it ends with a period (complete sentence)
-        assert rendered.rstrip().endswith(".")
-        # Verify it contains the beginning of the capabilities
-        assert "A" in rendered
-
-    @patch.object(ConfigLoader, "get_config")
-    def test_word_count_within_limit(self, mock_get_config):
-        """Short text stays unchanged."""
-        config = {
-            "name": "Bot",
-            "capabilities": "Short.",
-            "limitations": "None.",
-            "max_words": 100,
-            "follow_up": {}
-        }
-        mock_get_config.return_value = config
-        rendered = self.handler.render_introduction("en")
-        assert len(rendered.split()) <= 100
-        assert "Short." in rendered
-
-    @patch.object(ConfigLoader, "get_config")
-    def test_config_loaded_per_language(self, mock_get_config):
-        """Handler calls ConfigLoader with correct language."""
-        mock_get_config.return_value = {}
-        self.handler.render_introduction("fr")
-        mock_get_config.assert_called_with("fr")
-```
-
----
-
-```python
-# tests/test_follow_up_handler.py
-import pytest
-from unittest.mock import patch
-from handlers.follow_up_handler import FollowUpHandler
-from config.loader import ConfigLoader
-
-@pytest.mark.unit
-class TestFollowUpHandler:
-    """Unit tests for FollowUpHandler."""
-
-    def setup_method(self):
-        self.handler = FollowUpHandler()
-
-    @patch.object(ConfigLoader, "get_config")
-    def test_follow_up_returns_prompt_and_url(self, mock_get_config):
-        """Handler returns follow-up object from config."""
-        mock_get_config.return_value = {
-            "follow_up": {
-                "prompt": "Want more?",
-                "details_url": "/help"
-            }
-        }
-        result = self.handler.get_follow_up("en")
-        assert result == {"prompt": "Want more?", "details_url": "/help"}
-
-    @patch.object(ConfigLoader, "get_config")
-    def test_no_follow_up_for_initial_intro(self, mock_get_config):
-        """When intent is initial_intro, follow_up should not be returned."""
-        # In the real handler, this might return None or empty
-        result = self.handler.get_follow_up("en", is_initial=True)
-        assert result is None or result == {}
-```
-
----
-
-```python
-# tests/test_api.py
-import pytest
-from fastapi.testclient import TestClient
-from main import app
-from unittest.mock import patch, MagicMock
-
-@pytest.mark.integration
-class TestIntroductionAPI:
-    """Integration tests for POST /api/introduction."""
-
-    def test_intro_zh(self, client, mock_intent_detector, mock_language_detector, mock_config_loader):
-        """AC-02 & AC-03: Chinese request returns correct response and language."""
-        mock_intent_detector.classify.return_value = "initial_intro"
-        mock_language_detector.detect.return_value = "zh"
-        # Patch the introduction_handler to use mock config
-        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_ZH):
-            response = client.post("/api/introduction", json={"message": "请你介绍一下你自己"})
-            assert response.status_code == 200
-            data = response.json()
-            assert data["language"] == "zh"
-            assert "ChatBot" in data["response"]
-            assert "可以帮助" in data["response"]
-            assert "无法访问" in data["response"]
-
-    def test_intro_en(self, client, mock_intent_detector, mock_language_detector):
-        """AC-02 & AC-03: English request returns correct response and language."""
-        # Reset mocks if needed
-        mock_intent_detector.classify.return_value = "initial_intro"
-        mock_language_detector.detect.return_value = "en"
-        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_EN):
-            response = client.post("/api/introduction", json={"message": "Introduce yourself"})
-            assert response.status_code == 200
-            data = response.json()
-            assert data["language"] == "en"
-            assert "AI assistant" in data["response"]
-            assert "cannot access real-time" in data["response"]
-
-    def test_intro_fr(self, client, mock_intent_detector, mock_language_detector):
-        """AC-03: French request returns French response and language code."""
-        mock_intent_detector.classify.return_value = "initial_intro"
-        mock_language_detector.detect.return_value = "fr"
-        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_FR):
-            response = client.post("/api/introduction", json={"message": "Présentez-vous"})
-            assert response.status_code == 200
-            data = response.json()
-            assert data["language"] == "fr"
-            assert "ChatBot" in data["response"]
-            assert "Je peux" in data["response"]
-
-    def test_follow_up_request(self, client, mock_intent_detector, mock_language_detector):
-        """AC-07: Follow-up request returns follow_up_prompt."""
-        mock_intent_detector.classify.return_value = "follow_up"
-        mock_language_detector.detect.return_value = "en"
-        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_EN):
-            response = client.post("/api/introduction", json={"message": "tell me more"})
-            assert response.status_code == 200
-            data = response.json()
-            assert data["follow_up_prompt"] == SAMPLE_CONFIG_EN["follow_up"]["prompt"]
-            # Optionally check details_url if included in response (spec says it may)
-            # The spec example shows follow_up_prompt, not details_url in response
-
-    def test_empty_message_error(self, client):
-        """Empty message → 400 Bad Request."""
-        response = client.post("/api/introduction", json={"message": ""})
+    def test_duplicate_code_returns_error(self, client, mock_wechat_api):
+        """WeChat API might return error for reused code."""
+        response = client.post("/api/login", json={"code": "invalid_code"})
         assert response.status_code == 400
-        assert "detail" in response.json()  # FastAPI error detail
+        assert response.json["error"] == "invalid_code"
 
-    def test_missing_message_field(self, client):
-        """Missing 'message' field → 400 Bad Request."""
-        response = client.post("/api/introduction", json={})
+    def test_missing_code_returns_400(self, client):
+        """Request without 'code' field."""
+        response = client.post("/api/login", json={})
         assert response.status_code == 400
 
-    def test_server_error_on_config_fail(self, client, mock_intent_detector, mock_language_detector):
-        """Config load failure → 500 Internal Server Error."""
-        mock_intent_detector.classify.return_value = "initial_intro"
-        mock_language_detector.detect.return_value = "en"
-        with patch("handlers.introduction_handler.ConfigLoader.get_config", side_effect=FileNotFoundError):
-            response = client.post("/api/introduction", json={"message": "Hi"})
-            assert response.status_code == 500
+    def test_rate_limiting(self, client):
+        """If rate limiter enabled, 10 requests per minute per IP."""
+        for _ in range(10):
+            response = client.post("/api/login", json={"code": "some_code"})
+        # 11th request should be throttled
+        response = client.post("/api/login", json={"code": "some_code"})
+        assert response.status_code == 429
+        assert "Retry-After" in response.headers
 
-    def test_word_count_enforcement_integration(self, client, mock_intent_detector, mock_language_detector):
-        """AC-04: Response word count ≤ 100."""
-        # Use a config that would produce a long response
-        long_config = SAMPLE_CONFIG_EN.copy()
-        long_config["capabilities"] = "word " * 200
-        mock_intent_detector.classify.return_value = "initial_intro"
-        mock_language_detector.detect.return_value = "en"
-        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=long_config):
-            response = client.post("/api/introduction", json={"message": "Introduce yourself"})
-            assert response.status_code == 200
-            word_count = len(response.json()["response"].split())
-            assert word_count <= 100
+    def test_logging_masks_code(self, client, caplog, mock_wechat_api):
+        """Verify that code is masked in logs (first 4 chars + ****)."""
+        import logging
+        caplog.set_level(logging.INFO)
+        client.post("/api/login", json={"code": "abcdefgh"})
+        # Search for the masked version in log output
+        assert "abcd****" in caplog.text
+        # Ensure full code is not present
+        assert "abcdefgh" not in caplog.text
+```
 
-    def test_response_consistency(self, client, mock_intent_detector, mock_language_detector):
-        """AC-06: Ten identical requests return identical responses (ignoring exact whitespace)."""
-        mock_intent_detector.classify.return_value = "initial_intro"
-        mock_language_detector.detect.return_value = "en"
-        with patch("handlers.introduction_handler.ConfigLoader.get_config", return_value=SAMPLE_CONFIG_EN):
-            responses = []
-            for _ in range(10):
-                resp = client.post("/api/introduction", json={"message": "Introduce yourself"})
-                responses.append(resp.json()["response"])
-            # All responses should be identical
-            assert all(r == responses[0] for r in responses)
+### 2.3 POST /api/logout
+
+```python
+# tests/integration/test_auth_logout.py
+
+def test_logout_blacklists_token(client, mock_wechat_api):
+    """After logout, same token should be rejected for protected endpoints."""
+    # Login first
+    login_resp = client.post("/api/login", json={"code": "valid_code"})
+    token = login_resp.json["token"]
+
+    # Logout
+    logout_resp = client.post("/api/logout",
+                              headers={"Authorization": f"Bearer {token}"})
+    assert logout_resp.status_code == 200
+    assert logout_resp.json["message"] == "logged_out"
+
+    # Try to access protected endpoint with same token
+    profile_resp = client.get("/api/user/me",
+                              headers={"Authorization": f"Bearer {token}"})
+    assert profile_resp.status_code == 401
+```
+
+### 2.4 GET /api/user/me
+
+```python
+# tests/integration/test_user_profile.py
+
+def test_get_profile_success(client, mock_wechat_api):
+    """Retrieve authenticated user profile."""
+    # Login
+    login_resp = client.post("/api/login", json={"code": "valid_code"})
+    token = login_resp.json["token"]
+    user_id = login_resp.json["user"]["id"]
+
+    # Get profile
+    profile_resp = client.get("/api/user/me",
+                              headers={"Authorization": f"Bearer {token}"})
+    assert profile_resp.status_code == 200
+    data = profile_resp.json
+    assert data["id"] == user_id
+    assert "openid" not in data  # openid should not be exposed
+
+def test_get_profile_no_token_returns_401(client):
+    """Request without Authorization header."""
+    resp = client.get("/api/user/me")
+    assert resp.status_code == 401
+
+def test_get_profile_expired_token_returns_401(client):
+    """Simulate expired token."""
+    import jwt, time
+    # Manually create expired token
+    expired_payload = {"sub": "test_user", "exp": int(time.time()) - 3600}
+    expired_token = jwt.encode(expired_payload, "test_secret_key", algorithm="HS256")
+    resp = client.get("/api/user/me",
+                      headers={"Authorization": f"Bearer {expired_token}"})
+    assert resp.status_code == 401
+```
+
+### 2.5 Health Check
+
+```python
+# tests/integration/test_health.py
+
+def test_health_endpoint(client):
+    resp = client.get("/api/health")
+    assert resp.status_code == 200
+    assert resp.json == {"status": "ok"}
 ```
 
 ---
 
-**Notes for the QA team:**
+## 3. Additional Considerations
 
-- The tests above assume the existence of modules and classes matching the description (`IntentDetector`, `LanguageDetector`, `IntroductionHandler`, `FollowUpHandler`, `ConfigLoader`, and the FastAPI app in `main.py` with a `POST /api/introduction` endpoint). Adjust imports and patching targets according to the actual implementation.
-- Mocking is used for external dependencies (config loading, keyword lists) to isolate unit tests.
-- The integration tests use a `TestClient` and patches to simulate a full request/response lifecycle, verifying correctness, error handling, performance constraints (word count), and consistency.
-- To run the tests, place them inside the `tests/` directory as shown in the file structure and execute `pytest tests/` from the project root.
+- **Mocked Redis**: For token blacklist and rate‑limiting, use a fake Redis or in‑memory dictionary in tests.
+- **Database**: Use SQLite in‑memory for integration tests to avoid external dependencies.
+- **Async vs Sync**: The tests above show `@pytest.mark.asyncio` for services; adjust based on your framework.
+- **Security**: Include tests for CSRF (if applicable) and ensure `openid` is never leaked via API responses.
+- **Frontend**: Not covered here (pytest is backend). Frontend unit tests would be in Jest/Mocha.
+
+---
+
+Run the tests with:
+
+```bash
+pytest tests/ --cov=app --cov-report=term-missing
+```
+
+This suite covers the critical paths described in the specification, including success, failure, rate‑limiting, token lifecycle, and logging hygiene.

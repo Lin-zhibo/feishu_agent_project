@@ -15,7 +15,7 @@ feishu_agent_project/
 │   ├── review_chain.py
 │   └── delivery_chain.py
 ├── config/
-│   ├── model.json           # API key / base URL / model name
+│   ├── model.json           # LLM API key / base URL / model name
 │   └── settings.json        # Pipeline stage toggles, output dir
 ├── doc/
 │   └── TODO.md              # Development progress tracker
@@ -57,3 +57,8 @@ feishu_agent_project/
     "MODEL": "<model name>"
 }
 ```
+
+### config/ 目录说明
+
+- `config/settings.json` — 项目配置，包含 Pipeline 各阶段开关 (`stage_enabled`) 和输出目录 (`output_dir`)
+- `config/model.json` — 大模型相关配置，包含 API Key、Base URL、Model 名称
