@@ -1,2 +1,2 @@
 到手先在命令行运行 npm install命令来下载node_modules
-
+关于接口和其他的一些细节我放到Docking.tet里了，麻烦看一下哦
