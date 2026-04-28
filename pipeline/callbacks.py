@@ -63,12 +63,19 @@ class PipelineCallbackHandler(BaseCallbackHandler):
 
         # Extract token usage — check LangChain normalized metadata first, then raw API response
         usage: dict[str, Any] | None = None
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            usage = response.usage_metadata
-        elif hasattr(response, "response_metadata") and response.response_metadata:
-            token_usage = response.response_metadata.get("token_usage", {})
+
+        # First, try to get from LLMResult.llm_output (raw provider response)
+        if hasattr(response, "llm_output") and response.llm_output:
+            token_usage = response.llm_output.get("token_usage", {})
             if token_usage:
                 usage = token_usage
+
+        # Then, try to get from AIMessage inside generations (LangChain normalized)
+        if not usage and hasattr(response, "generations") and response.generations:
+            gen = response.generations[0][0]
+            msg = getattr(gen, "message", None) or getattr(gen, "text", None)
+            if hasattr(msg, "usage_metadata") and msg.usage_metadata:
+                usage = msg.usage_metadata
 
         prompt_tokens = 0
         completion_tokens = 0

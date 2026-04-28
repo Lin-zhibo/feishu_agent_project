@@ -93,6 +93,11 @@ def main() -> None:
         default="out",
         help="Output directory for artifacts",
     )
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip all checkpoints (auto-approve)",
+    )
 
     args = parser.parse_args()
 
@@ -111,6 +116,7 @@ async def _run(args: argparse.Namespace) -> None:
     config = load_settings(config_path)
     config = resolve_model_config(config)
     config.output_dir = args.output_dir
+    config.skip_checkpoints = args.yes
 
     if args.skip_requirements:
         config.stage_enabled["requirements"] = False

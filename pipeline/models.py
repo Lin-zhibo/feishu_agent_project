@@ -11,7 +11,27 @@ Classes:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class CheckpointDecision(Enum):
+    """Decision made at a checkpoint."""
+    APPROVE = "approve"
+    REJECT = "reject"
+
+
+@dataclass
+class CheckpointResult:
+    """
+    Result of a checkpoint review.
+
+    Attributes:
+        decision: The user's decision (APPROVE or REJECT).
+        reason: Reason for rejection (only set when decision is REJECT).
+    """
+    decision: CheckpointDecision
+    reason: str | None = None
 
 
 @dataclass
@@ -99,3 +119,4 @@ class PipelineConfig:
         "delivery": True,
     })
     output_dir: str = "out"
+    skip_checkpoints: bool = False  # When True, skip all Y/n confirmations

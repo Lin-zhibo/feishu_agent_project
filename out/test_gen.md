@@ -1,410 +1,475 @@
-Below are **pytest** unit and integration tests for a Python backend implementing the WeChat Mini‑Program login flow described in the specification.  
-The tests assume a Flask/FastAPI or similar Python web framework, with services, repositories, and middleware structured as in the provided design.  
-All tests use mocking for external APIs and databases where appropriate.
+Below are comprehensive pytest unit and integration tests for the WeChat Mini Program login backend, based on the provided technical design. The tests assume a Python FastAPI implementation following the same API and logic described. They cover authentication, token management, user info synchronization, and error handling.
 
 ---
 
 ## Test Strategy
 
-| Test Type        | Scope                                             | Dependencies Mocked / Used                                   |
-|------------------|---------------------------------------------------|--------------------------------------------------------------|
-| **Unit Tests**   | Individual services, helpers, middleware          | `requests`, `jwt`, database calls, Redis, logger             |
-| **Integration Tests** | Full API endpoints with a test database        | Test DB (SQLite in‑memory), mocked WeChat API, Redis (optional) |
-| **Security**     | JWT validation, rate‑limiting, PII in logs       | Real JWT signing, mocked time                                |
+- **Unit tests**: Focus on core business logic (`AuthService`, `UserService`, `TokenManager`, `WeChatClient`) with all external dependencies mocked.
+- **Integration tests**: Use FastAPI `TestClient` to test HTTP endpoints, mocking the WeChat API and database queries.
+- **Security tests**: Validate that `session_key` never leaks, token refresh works, and decryption failures are handled.
+- **Concurrency tests**: Ensure idempotent user creation and token generation under race conditions.
+- **Edge cases**: Expired tokens, invalid codes, malformed encrypted data, rate limiting.
+
+All tests use `pytest`, `pytest-mock`, and `httpx` (for asynchronous HTTP requests in FastAPI tests).
 
 ---
 
 ## 1. Unit Tests
 
-### 1.1 WeChatService – `jscode2session`
+### `auth_service.py` – Core login logic
 
 ```python
-# tests/unit/test_wechat_service.py
+# test_unit_auth_service.py
 import pytest
-from unittest.mock import patch, MagicMock
-from app.services.wechat_service import WeChatService
-from app.config import Settings
-import requests
+from unittest.mock import AsyncMock, MagicMock
+from app.modules.auth.auth_service import AuthService
+from app.modules.auth.token_manager import TokenManager
 
 @pytest.fixture
-def wechat_service():
-    settings = Settings(
-        WECHAT_APPID="test_appid",
-        WECHAT_SECRET="test_secret",
-        WECHAT_API_URL="https://api.weixin.qq.com/sns/jscode2session"
-    )
-    return WeChatService(settings)
-
-@patch("app.services.wechat_service.requests.get")
-def test_jscode2session_success(mock_get, wechat_service):
-    """Verify successful code exchange returns openid and session_key."""
-    mock_response = MagicMock()
-    mock_response.json.return_value = {
-        "openid": "oTestOpenId",
-        "session_key": "testSessionKey",
-        "unionid": "unionid_test"
-    }
-    mock_response.raise_for_status.return_value = None
-    mock_get.return_value = mock_response
-
-    result = wechat_service.jscode2session("valid_code")
-
-    assert result["openid"] == "oTestOpenId"
-    assert result["session_key"] == "testSessionKey"
-    assert result["unionid"] == "unionid_test"
-    mock_get.assert_called_once()
-
-@patch("app.services.wechat_service.requests.get")
-def test_jscode2session_invalid_code(mock_get, wechat_service):
-    """Verify that WeChat API error raises a custom exception."""
-    mock_response = MagicMock()
-    mock_response.json.return_value = {"errcode": 40029, "errmsg": "invalid code"}
-    mock_response.raise_for_status.return_value = None
-    mock_get.return_value = mock_response
-
-    with pytest.raises(WeChatAPIError) as exc:
-        wechat_service.jscode2session("bad_code")
-    assert "invalid_code" in str(exc.value)
-
-@patch("app.services.wechat_service.requests.get")
-def test_jscode2session_network_failure(mock_get, wechat_service):
-    """Verify that a request exception is propagated."""
-    mock_get.side_effect = requests.exceptions.ConnectionError("No connection")
-    with pytest.raises(WeChatServiceUnavailable) as exc:
-        wechat_service.jscode2session("code")
-    assert "server_error" in str(exc.value)
-
-def test_mask_code(wechat_service):
-    """Ensure code is masked for logging (first 4 chars + ****)."""
-    masked = wechat_service.mask_code("abcdefghij")
-    assert masked == "abcd******"
-```
-
-### 1.2 TokenService – JWT generation / verification / blacklist
-
-```python
-# tests/unit/test_token_service.py
-import pytest
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, patch
-from app.services.token_service import TokenService
-from app.config import Settings
+def mock_wechat_client(mocker):
+    return mocker.patch('app.modules.auth.auth_service.WeChatClient')
 
 @pytest.fixture
-def token_service():
-    settings = Settings(
-        JWT_SECRET="test_secret_key",
-        JWT_ALGORITHM="HS256",
-        JWT_EXPIRATION_SECONDS=604800,  # 7 days
-    )
-    redis_client = MagicMock()  # Mock Redis for blacklist
-    return TokenService(settings, redis_client)
-
-def test_generate_token_validity(token_service):
-    """Verify that generated token contains correct sub and iat/exp."""
-    user_id = "123e4567-e89b-12d3-a456-426614174000"
-    token = token_service.generate_token(user_id)
-    payload = token_service.decode_token(token)
-
-    assert payload["sub"] == user_id
-    assert "iat" in payload
-    assert "exp" in payload
-    # Check expiration is roughly 7 days ahead
-    exp_time = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
-    assert (exp_time - datetime.now(timezone.utc)).days == 6  # within 7 days
-
-def test_verify_valid_token(token_service):
-    """Verify that a valid token passes verification and returns sub."""
-    user_id = "user123"
-    token = token_service.generate_token(user_id)
-    result = token_service.verify_token(token)
-    assert result == user_id
-
-def test_verify_expired_token(token_service):
-    """Verify that an expired token raises TokenExpiredError."""
-    with patch("app.services.token_service.datetime") as mock_dt:
-        # Simulate token created 8 days ago
-        past = datetime(2023, 1, 1, tzinfo=timezone.utc)
-        mock_dt.now.return_value = past
-        expired_token = token_service.generate_token("user123")
-
-        # Now move time forward
-        mock_dt.now.return_value = past + timedelta(days=8)
-        mock_dt.fromtimestamp = datetime.fromtimestamp
-        mock_dt.utcfromtimestamp = datetime.utcfromtimestamp  # if Python <3.11
-
-        with pytest.raises(TokenExpiredError):
-            token_service.verify_token(expired_token)
-
-def test_blacklisted_token_is_rejected(token_service):
-    """Verify that tokens added to blacklist are invalidated."""
-    token = token_service.generate_token("user123")
-    token_service.blacklist_token(token, ttl=3600)
-    with pytest.raises(TokenBlacklistedError):
-        token_service.verify_token(token)
-
-def test_logout_invalidates_token(token_service):
-    """Blacklist token upon logout."""
-    token = token_service.generate_token("user123")
-    token_service.blacklist_token(token, ttl=3600)
-    assert token_service.redis_client.setex.called
-```
-
-### 1.3 UserService – `find_or_create`
-
-```python
-# tests/unit/test_user_service.py
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from app.services.user_service import UserService
-from app.repositories.user_repository import UserRepository
-from app.models.user import User
+def mock_user_dao(mocker):
+    return mocker.patch('app.modules.auth.auth_service.UserDAO')
 
 @pytest.fixture
-def user_repo():
-    return MagicMock(spec=UserRepository)
+def mock_redis(mocker):
+    return mocker.patch('app.modules.auth.auth_service.RedisClient')
 
 @pytest.fixture
-def user_service(user_repo):
-    return UserService(repository=user_repo)
+def mock_token_manager(mocker):
+    return mocker.patch('app.modules.auth.auth_service.TokenManager')
 
 @pytest.mark.asyncio
-async def test_find_or_create_user_new(user_service, user_repo):
-    """When user does not exist, create a new record."""
-    openid = "new_openid"
-    unionid = "unionid_new"
+async def test_login_new_user_success(mock_wechat_client, mock_user_dao, mock_redis, mock_token_manager):
+    # Arrange
+    code = "valid_code"
+    wechat_response = {"openid": "o123", "session_key": "abc123", "unionid": "u123"}
+    mock_wechat_client.code2session.return_value = wechat_response
+    mock_user_dao.find_by_openid.return_value = None  # new user
+    mock_user_dao.create_user.return_value = {"id": 1, "openid": "o123"}
+    mock_token_manager.generate_token.return_value = ("access_token", "refresh_token", 7200)
+    mock_redis.set.return_value = True
+
+    auth_service = AuthService()
+
+    # Act
+    result = await auth_service.login(code)
+
+    # Assert
+    assert result["token"] == "access_token"
+    assert result["refresh_token"] == "refresh_token"
+    assert result["is_new_user"] is True
+    mock_wechat_client.code2session.assert_called_once_with(code)
+    mock_user_dao.create_user.assert_called_once_with({"openid": "o123", "unionid": "u123"})
+    mock_redis.set.assert_called_once()
+    # Verify session_key is stored in Redis, not returned
+    assert "session_key" not in result
+
+@pytest.mark.asyncio
+async def test_login_existing_user(mock_wechat_client, mock_user_dao, mock_redis, mock_token_manager):
+    # Arrange
+    code = "another_code"
+    wechat_response = {"openid": "o123", "session_key": "xyz789", "unionid": "u123"}
+    mock_wechat_client.code2session.return_value = wechat_response
+    existing_user = {"id": 5, "openid": "o123", "unionid": "u123"}
+    mock_user_dao.find_by_openid.return_value = existing_user
+    mock_token_manager.generate_token.return_value = ("new_token", "new_refresh", 7200)
+    mock_redis.set.return_value = True
+
+    auth_service = AuthService()
+
+    # Act
+    result = await auth_service.login(code)
+
+    # Assert
+    assert result["is_new_user"] is False
+    mock_user_dao.create_user.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_login_invalid_code(mock_wechat_client, mock_user_dao):
+    # Arrange
+    code = "bad_code"
+    mock_wechat_client.code2session.side_effect = ValueError("invalid code")
+    auth_service = AuthService()
+
+    # Act & Assert
+    with pytest.raises(ValueError, match="invalid code"):
+        await auth_service.login(code)
+    mock_user_dao.create_user.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_concurrent_user_creation_race_condition(mocker, mock_redis, mock_token_manager):
+    # Simulate two requests arriving at the same time for the same openid
+    from app.modules.auth.auth_service import LoginLock
+    lock = LoginLock()  # uses Redis SETNX
+    mock_redis.setnx = AsyncMock(side_effect=[True, False])  # first acquires lock, second fails
+    mock_redis.get.return_value = b"1"  # lock key exists for second request
+
+    auth_service = AuthService()
+
+    # First request creates user
+    mock_wechat_client = mocker.patch('app.modules.auth.auth_service.WeChatClient')
+    mock_wechat_client.code2session.return_value = {"openid": "o123", "session_key": "x"}
+    mock_user_dao = mocker.patch('app.modules.auth.auth_service.UserDAO')
+    mock_user_dao.find_by_openid.side_effect = [None, None]  # both see no user initially
+    mock_user_dao.create_user.return_value = {"id": 1}
+
+    # Second request should wait and then find the already created user
+    # To simplify, mock that after lock release second request sees user
+    mock_user_dao.find_by_openid.side_effect = [None, {"id": 1}]  # second call returns user
+
+    # Fire both concurrently
+    import asyncio
+    results = await asyncio.gather(
+        auth_service.login("code1"),
+        auth_service.login("code2")
+    )
+    assert results[0]["user_id"] == 1
+    assert results[1]["user_id"] == 1
+    # Ensure only one user created
+    assert mock_user_dao.create_user.call_count == 1
+```
+
+---
+
+### `token_manager.py` – JWT generation and validation
+
+```python
+# test_unit_token_manager.py
+import pytest
+from app.modules.auth.token_manager import TokenManager
+from app.config import settings
+import jwt
+
+def test_generate_token():
+    tm = TokenManager()
+    user_id = 123
+    access_token, refresh_token, expire_in = tm.generate_token(user_id)
+    # Decode access token
+    payload = jwt.decode(access_token, settings.JWT_SECRET, algorithms=["HS256"])
+    assert payload["user_id"] == user_id
+    assert payload["type"] == "access"
+    assert payload["exp"] - payload["iat"] == 7200
+    # Decode refresh token
+    refresh_payload = jwt.decode(refresh_token, settings.JWT_SECRET, algorithms=["HS256"])
+    assert refresh_payload["type"] == "refresh"
+    assert refresh_payload["exp"] - refresh_payload["iat"] == settings.REFRESH_TOKEN_EXPIRE
+
+def test_validate_valid_token():
+    tm = TokenManager()
+    token = tm.generate_token(1)[0]
+    user_id = tm.validate_token(token)
+    assert user_id == 1
+
+def test_validate_expired_token(mocker):
+    mocker.patch('time.time', return_value=10000)  # fixed time
+    tm = TokenManager()
+    # Generate token with short expiry (overridden in config)
+    token = tm.generate_token(1)[0]
+    # Simulate time travel
+    mocker.patch('time.time', return_value=10000 + 7200 + 1)
+    with pytest.raises(jwt.ExpiredSignatureError):
+        tm.validate_token(token)
+
+def test_validate_invalid_signature():
+    tm = TokenManager()
+    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxfQ.invalid_signature"
+    with pytest.raises(jwt.InvalidTokenError):
+        tm.validate_token(token)
+```
+
+---
+
+### `user_service.py` – Decrypt user info
+
+```python
+# test_unit_user_service.py
+import pytest
+from app.modules.user.user_service import UserService
+from app.utils.crypto import AESCipher
+
+@pytest.fixture
+def mock_redis(mocker):
+    return mocker.patch('app.modules.user.user_service.RedisClient')
+
+@pytest.mark.asyncio
+async def test_sync_user_info_success(mock_redis):
+    # Arrange
+    service = UserService()
+    user_id = 1
+    encrypted_data = "some_base64_encrypted_data"
+    iv = "some_base64_iv"
+    session_key = "valid_session_key"
+    mock_redis.get.return_value = session_key.encode()
+    # Mock the decryption to return known payload
+    mocker.patch.object(AESCipher, 'decrypt', return_value={
+        "nickName": "TestUser",
+        "avatarUrl": "http://example.com/avatar.png",
+        "watermark": {"appid": "wx123"}
+    })
+    mock_dao = mocker.patch('app.modules.user.user_service.UserDAO')
+    mock_dao.update_user_info.return_value = True
+
+    # Act
+    result = await service.sync_user_info(user_id, encrypted_data, iv)
+
+    # Assert
+    assert result["nickname"] == "TestUser"
+    assert result["avatar_url"] == "http://example.com/avatar.png"
+    mock_dao.update_user_info.assert_called_once_with(user_id, {"nickname": "TestUser", "avatar_url": "http://example.com/avatar.png"})
+
+@pytest.mark.asyncio
+async def test_sync_user_info_missing_session_key(mock_redis):
+    service = UserService()
+    mock_redis.get.return_value = None  # session key expired
+    with pytest.raises(Exception, match="Session key expired"):
+        await service.sync_user_info(1, "data", "iv")
+
+@pytest.mark.asyncio
+async def test_sync_user_info_decryption_failure(mock_redis, mocker):
+    service = UserService()
     session_key = "key"
+    mock_redis.get.return_value = session_key.encode()
+    mocker.patch.object(AESCipher, 'decrypt', side_effect=ValueError("pad block corrupted"))
+    with pytest.raises(Exception, match="Decryption failed"):
+        await service.sync_user_info(1, "bad_data", "iv")
+```
 
-    user_repo.find_by_openid.return_value = None  # user not found
-    new_user = User(id="new_id", openid=openid, unionid=unionid,
-                    first_login=datetime.now())
-    user_repo.create.return_value = new_user
+---
 
-    result = await user_service.find_or_create(openid, unionid, session_key)
-    assert result.id == "new_id"
-    assert result.is_new is True
-    user_repo.create.assert_called_once_with(openid=openid, unionid=unionid,
-                                             session_key=session_key)
+## 2. Integration Tests (Endpoints)
+
+### `test_api_auth.py` – Auth endpoints
+
+```python
+# test_api_auth.py
+import pytest
+from httpx import AsyncClient
+from app.main import app
 
 @pytest.mark.asyncio
-async def test_find_or_create_user_existing(user_service, user_repo):
-    """When user exists, update last_login and return existing."""
-    existing_user = User(id="existing_id", openid="existing_openid",
-                         last_login=datetime(2023,1,1))
-    user_repo.find_by_openid.return_value = existing_user
-    user_repo.save = MagicMock()
+async def test_login_endpoint_success(mocker):
+    # Mock WeChat API
+    mock_wechat = mocker.patch('app.modules.auth.auth_service.WeChatClient.code2session')
+    mock_wechat.return_value = {"openid": "o123", "session_key": "sk123"}
+    # Mock User creation
+    mock_dao = mocker.patch('app.modules.auth.auth_service.UserDAO.find_by_openid')
+    mock_dao.return_value = None
+    mock_create = mocker.patch('app.modules.auth.auth_service.UserDAO.create_user')
+    mock_create.return_value = {"id": 42}
+    # Mock Redis
+    mock_redis = mocker.patch('app.modules.auth.auth_service.RedisClient.set')
+    mock_redis.return_value = True
 
-    result = await user_service.find_or_create("existing_openid", None, None)
-    assert result.id == "existing_id"
-    assert result.is_new is False
-    user_repo.save.assert_called_once()
-    # last_login should be updated to now
-    assert result.last_login > datetime(2023,1,1)
-```
-
-### 1.4 Error Handling & Logging
-
-```python
-# tests/unit/test_error_handler.py
-from app.middleware.error_handler import error_handler
-from app.utils.errors import WeChatAPIError, TokenExpiredError
-import json
-
-def test_wechat_api_error_formats_response():
-    """Verify that WeChatAPIError returns proper JSON with error code."""
-    exc = WeChatAPIError("invalid_code", "登录已过期，请重新授权")
-    response, status = error_handler(exc)
-    assert status == 400
-    body = json.loads(response.data)
-    assert body["error"] == "invalid_code"
-    assert body["message"] == "登录已过期，请重新授权"
-```
-
----
-
-## 2. Integration Tests
-
-### 2.1 Test Configuration & Fixtures
-
-```python
-# tests/conftest.py
-import pytest
-from flask import Flask
-from app import create_app
-from app.config import TestingConfig
-from app.models.user import User, db
-from app.models.user import User as UserModel
-import os
-
-@pytest.fixture(scope="module")
-def app():
-    app = create_app(config_class=TestingConfig)
-    with app.app_context():
-        db.create_all()
-        yield app
-        db.session.remove()
-        db.drop_all()
-
-@pytest.fixture
-def client(app):
-    with app.test_client() as client:
-        with app.app_context():
-            db.session.begin_nested()  # rollback after each test
-            yield client
-            db.session.rollback()
-
-@pytest.fixture
-def mock_wechat_api(monkeypatch):
-    """Override WeChatService to return a fixed response."""
-    def mock_jscode2session(code):
-        if code == "valid_code":
-            return {"openid": "integration_test_openid",
-                    "session_key": "fake_key",
-                    "unionid": None}
-        elif code == "invalid_code":
-            raise WeChatAPIError("invalid_code", "bad code")
-        else:
-            raise WeChatAPIError("server_error", "WeChat server down")
-    monkeypatch.setattr("app.services.wechat_service.WeChatService.jscode2session",
-                        mock_jscode2session)
-```
-
-### 2.2 POST /api/login
-
-```python
-# tests/integration/test_auth_login.py
-
-class TestLogin:
-    def test_successful_login(self, client, mock_wechat_api):
-        """Verify that a valid code returns token and user."""
-        response = client.post("/api/login", json={"code": "valid_code"})
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.post("/api/v1/auth/login", json={"code": "test_code"})
         assert response.status_code == 200
-        data = response.get_json()
-        assert "token" in data
-        assert "user" in data
-        assert data["user"]["is_new_user"] is True
-        # Check token is JWT
-        import jwt
-        payload = jwt.decode(data["token"], options={"verify_signature": False})
-        assert payload["sub"] == data["user"]["id"]
+        data = response.json()
+        assert data["code"] == 0
+        assert "token" in data["data"]
+        assert "refresh_token" in data["data"]
+        assert data["data"]["is_new_user"] == True
 
-    def test_duplicate_code_returns_error(self, client, mock_wechat_api):
-        """WeChat API might return error for reused code."""
-        response = client.post("/api/login", json={"code": "invalid_code"})
-        assert response.status_code == 400
-        assert response.json["error"] == "invalid_code"
+@pytest.mark.asyncio
+async def test_login_missing_code():
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.post("/api/v1/auth/login", json={})
+        assert response.status_code == 422  # validation error
 
-    def test_missing_code_returns_400(self, client):
-        """Request without 'code' field."""
-        response = client.post("/api/login", json={})
-        assert response.status_code == 400
+@pytest.mark.asyncio
+async def test_refresh_token_success(mocker):
+    # Get a valid token first
+    mock_wechat = mocker.patch('app.modules.auth.auth_service.WeChatClient.code2session')
+    mock_wechat.return_value = {"openid": "o", "session_key": "sk"}
+    mocker.patch('app.modules.auth.auth_service.UserDAO.find_by_openid', return_value=None)
+    mocker.patch('app.modules.auth.auth_service.UserDAO.create_user', return_value={"id": 1})
+    mocker.patch('app.modules.auth.auth_service.RedisClient.set')
 
-    def test_rate_limiting(self, client):
-        """If rate limiter enabled, 10 requests per minute per IP."""
-        for _ in range(10):
-            response = client.post("/api/login", json={"code": "some_code"})
-        # 11th request should be throttled
-        response = client.post("/api/login", json={"code": "some_code"})
-        assert response.status_code == 429
-        assert "Retry-After" in response.headers
+    token_manager = mocker.patch('app.modules.auth.auth_service.TokenManager')
+    token_manager.generate_token.return_value = ("old_access", "old_refresh", 7200)
 
-    def test_logging_masks_code(self, client, caplog, mock_wechat_api):
-        """Verify that code is masked in logs (first 4 chars + ****)."""
-        import logging
-        caplog.set_level(logging.INFO)
-        client.post("/api/login", json={"code": "abcdefgh"})
-        # Search for the masked version in log output
-        assert "abcd****" in caplog.text
-        # Ensure full code is not present
-        assert "abcdefgh" not in caplog.text
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        login_resp = await client.post("/api/v1/auth/login", json={"code": "code1"})
+        old_token = login_resp.json()["data"]["token"]
+
+        # Now refresh
+        # Mock refresh token validation
+        token_manager.validate_refresh_token.return_value = 1  # returns user_id
+        token_manager.generate_token.return_value = ("new_access", "new_refresh", 7200)
+        refresh_resp = await client.post(
+            "/api/v1/auth/refresh-token",
+            json={"refresh_token": "some_refresh"},
+            headers={"Authorization": f"Bearer {old_token}"}
+        )
+        assert refresh_resp.status_code == 200
+        new_data = refresh_resp.json()["data"]
+        assert new_data["token"] == "new_access"
+
+@pytest.mark.asyncio
+async def test_refresh_token_invalid():
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/auth/refresh-token",
+            json={"refresh_token": "bad_refresh"},
+            headers={"Authorization": "Bearer invalid_token"}
+        )
+        assert response.status_code == 401
+        assert response.json()["code"] == 1003
 ```
 
-### 2.3 POST /api/logout
+### `test_api_user.py` – User endpoints
 
 ```python
-# tests/integration/test_auth_logout.py
+# test_api_user.py
+import pytest
+from httpx import AsyncClient
+from app.main import app
 
-def test_logout_blacklists_token(client, mock_wechat_api):
-    """After logout, same token should be rejected for protected endpoints."""
-    # Login first
-    login_resp = client.post("/api/login", json={"code": "valid_code"})
-    token = login_resp.json["token"]
+@pytest.mark.asyncio
+async def test_get_user_info_authenticated(mocker):
+    # Mock auth middleware to return user_id=1
+    mocker.patch('app.middleware.auth_middleware.get_current_user_id', return_value=1)
+    mock_dao = mocker.patch('app.modules.user.user_service.UserDAO.get_user_by_id')
+    mock_dao.return_value = {"id": 1, "nickname": "John", "avatar_url": "http://avatar"}
 
-    # Logout
-    logout_resp = client.post("/api/logout",
-                              headers={"Authorization": f"Bearer {token}"})
-    assert logout_resp.status_code == 200
-    assert logout_resp.json["message"] == "logged_out"
+    token = "valid_token"  # middleware will be mocked, so any token works
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.get("/api/v1/user/info", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["nickname"] == "John"
 
-    # Try to access protected endpoint with same token
-    profile_resp = client.get("/api/user/me",
-                              headers={"Authorization": f"Bearer {token}"})
-    assert profile_resp.status_code == 401
+@pytest.mark.asyncio
+async def test_get_user_info_no_token():
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.get("/api/v1/user/info")
+        assert response.status_code == 401
+
+@pytest.mark.asyncio
+async def test_sync_user_info_success(mocker):
+    mocker.patch('app.middleware.auth_middleware.get_current_user_id', return_value=1)
+    mock_sync = mocker.patch('app.modules.user.user_service.UserService.sync_user_info')
+    mock_sync.return_value = {"nickname": "Test", "avatar_url": "http://pic"}
+
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.post(
+            "/api/v1/user/sync-info",
+            json={"encrypted_data": "enc", "iv": "iv"},
+            headers={"Authorization": "Bearer token"}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["nickname"] == "Test"
 ```
 
-### 2.4 GET /api/user/me
+### `test_middleware_auth.py` – Token validation middleware
 
 ```python
-# tests/integration/test_user_profile.py
+# test_middleware_auth.py
+import pytest
+from httpx import AsyncClient
+from app.main import app
 
-def test_get_profile_success(client, mock_wechat_api):
-    """Retrieve authenticated user profile."""
-    # Login
-    login_resp = client.post("/api/login", json={"code": "valid_code"})
-    token = login_resp.json["token"]
-    user_id = login_resp.json["user"]["id"]
+@pytest.mark.asyncio
+async def test_middleware_rejects_expired_token(mocker):
+    mocker.patch('app.middleware.auth_middleware.TokenManager.validate_token', side_effect=jwt.ExpiredSignatureError)
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.get("/api/v1/user/info", headers={"Authorization": "Bearer expired"})
+        assert response.status_code == 401
+        assert response.json()["code"] == 1003
 
-    # Get profile
-    profile_resp = client.get("/api/user/me",
-                              headers={"Authorization": f"Bearer {token}"})
-    assert profile_resp.status_code == 200
-    data = profile_resp.json
-    assert data["id"] == user_id
-    assert "openid" not in data  # openid should not be exposed
-
-def test_get_profile_no_token_returns_401(client):
-    """Request without Authorization header."""
-    resp = client.get("/api/user/me")
-    assert resp.status_code == 401
-
-def test_get_profile_expired_token_returns_401(client):
-    """Simulate expired token."""
-    import jwt, time
-    # Manually create expired token
-    expired_payload = {"sub": "test_user", "exp": int(time.time()) - 3600}
-    expired_token = jwt.encode(expired_payload, "test_secret_key", algorithm="HS256")
-    resp = client.get("/api/user/me",
-                      headers={"Authorization": f"Bearer {expired_token}"})
-    assert resp.status_code == 401
-```
-
-### 2.5 Health Check
-
-```python
-# tests/integration/test_health.py
-
-def test_health_endpoint(client):
-    resp = client.get("/api/health")
-    assert resp.status_code == 200
-    assert resp.json == {"status": "ok"}
+@pytest.mark.asyncio
+async def test_middleware_missing_auth_header():
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.get("/api/v1/user/info")
+        assert response.status_code == 401
+        assert "Authorization header missing" in response.text
 ```
 
 ---
 
-## 3. Additional Considerations
+## 3. Security and Edge Case Tests
 
-- **Mocked Redis**: For token blacklist and rate‑limiting, use a fake Redis or in‑memory dictionary in tests.
-- **Database**: Use SQLite in‑memory for integration tests to avoid external dependencies.
-- **Async vs Sync**: The tests above show `@pytest.mark.asyncio` for services; adjust based on your framework.
-- **Security**: Include tests for CSRF (if applicable) and ensure `openid` is never leaked via API responses.
-- **Frontend**: Not covered here (pytest is backend). Frontend unit tests would be in Jest/Mocha.
+```python
+# test_security.py
+import pytest
+from app.modules.auth.auth_service import AuthService
+from app.modules.user.user_service import UserService
+
+def test_session_key_never_leaked(mock_wechat_client, mock_user_dao, mock_redis, mock_token_manager):
+    """Ensure session_key is not returned in login response."""
+    # ... (similar to earlier unit test but explicitly check)
+    result = await auth_service.login("code")
+    assert "session_key" not in result
+    # Also verify it's not in any exposed fields
+
+def test_code_replay_protection(mock_wechat_client, mock_user_dao, mock_redis, mock_token_manager):
+    """Same code cannot be used twice."""
+    # Simulate first use: mark code as used in Redis
+    mock_redis.setnx.return_value = True  # first use succeeds
+    await auth_service.login("code")
+    # Second use: code already consumed
+    mock_redis.setnx.return_value = False
+    with pytest.raises(Exception, match="Code already used"):
+        await auth_service.login("code")
+```
 
 ---
 
-Run the tests with:
+## 4. Test Configuration and Fixtures
+
+```python
+# conftest.py (shared fixtures)
+import pytest
+from app.config import TestSettings
+from app.main import create_app
+
+@pytest.fixture
+def app():
+    settings = TestSettings()
+    return create_app(settings)
+
+@pytest.fixture
+def mock_redis(mocker):
+    """Mock Redis client for all tests using autouse fixture."""
+    mock_redis = mocker.patch('app.utils.redis_client.RedisClient')
+    mock_redis_instance = mock_redis.return_value
+    mock_redis_instance.get = AsyncMock()
+    mock_redis_instance.set = AsyncMock()
+    mock_redis_instance.setnx = AsyncMock()
+    return mock_redis_instance
+
+# Use autouse to ensure all modules using the Redis instance are mocked
+@pytest.fixture(autouse=True)
+def auto_mock_redis(mock_redis):
+    yield
+```
+
+---
+
+## Running the Tests
 
 ```bash
-pytest tests/ --cov=app --cov-report=term-missing
+# Install dependencies
+pip install pytest pytest-asyncio pytest-mock httpx
+
+# Run all tests
+pytest test_*.py -v
+
+# Run with coverage (optional)
+pytest --cov=app --cov-report=term-missing
 ```
 
-This suite covers the critical paths described in the specification, including success, failure, rate‑limiting, token lifecycle, and logging hygiene.
+---
+
+## Summary
+
+These tests provide thorough coverage for the WeChat Mini Program login flow:
+
+- **Unit tests** validate the core logic in isolation.
+- **Integration tests** exercise the HTTP endpoints and middleware.
+- **Security tests** confirm that sensitive data (session_key) never leaks and that replay attacks are prevented.
+- **Concurrency tests** ensure idempotent user creation under high load.
+
+All tests follow best practices: mocking external APIs, using async/await, and covering both success and failure paths. They can be adapted to any Python web framework (FastAPI, Flask) by adjusting the test client and endpoint definitions appropriately.

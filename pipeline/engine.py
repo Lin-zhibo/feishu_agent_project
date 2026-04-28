@@ -1,18 +1,25 @@
 """
 Pipeline engine for the DevFlow Engine.
 
-Sequentially executes the 6 stages using LangChain SequentialChain.
+Sequentially executes the 6 stages using LangChain RunnableSequence,
+with Human-in-the-Loop checkpoints at solution and review stages.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from pathlib import Path
 
 from pipeline.callbacks import PipelineCallbackHandler
-from pipeline.models import PipelineConfig, PipelineState, StageInput, StageOutput
+from pipeline.checkpoint import confirm_checkpoint
+from pipeline.models import (
+    CheckpointDecision,
+    PipelineConfig,
+    PipelineState,
+    StageInput,
+    StageOutput,
+)
 from chains import (
     create_requirements_chain,
     create_solution_chain,
@@ -41,10 +48,12 @@ STAGE_ORDER = [
     "delivery",
 ]
 
+MAX_RETRY = 10
+
 
 async def run(input_text: str, config: PipelineConfig) -> PipelineState:
     """
-    Run the full pipeline using LangChain SequentialChain.
+    Run the full pipeline with checkpoint approvals.
 
     Args:
         input_text: The user's raw requirement string.
@@ -61,14 +70,21 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
     handler = PipelineCallbackHandler()
     PipelineCallbackHandler.reset_totals()
 
-    for stage_name in STAGE_ORDER:
+    stage_idx = 0
+    retry_counts: dict[str, int] = {"solution": 0, "review": 0}
+
+    while stage_idx < len(STAGE_ORDER):
+        stage_name = STAGE_ORDER[stage_idx]
+
         if not config.stage_enabled.get(stage_name, True):
             _log.info("Stage '%s' skipped (disabled)", stage_name)
+            stage_idx += 1
             continue
 
         agent = _get_agent(stage_name)
         if agent is None:
             _log.warning("No agent found for stage '%s'", stage_name)
+            stage_idx += 1
             continue
 
         current_input = _get_current_input(stage_name, input_text, state)
@@ -100,6 +116,41 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
 
         await _write_output(config.output_dir, stage_name, output)
         _log.info("Stage '%s' artifacts written to '%s/'", stage_name, config.output_dir)
+
+        # Checkpoint after "solution"
+        if stage_name == "solution":
+            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints)
+            if decision.decision == CheckpointDecision.REJECT:
+                if retry_counts["solution"] >= MAX_RETRY:
+                    raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'solution'. Pipeline terminated.")
+                retry_counts["solution"] += 1
+                _log.warning("Solution rejected (attempt %d). Retrying with requirements.", retry_counts["solution"])
+                state.solution = None
+                state.code_diff = None
+                state.test_code = None
+                state.review_report = None
+                state.final_output = None
+                # Jump back to solution
+                stage_idx = STAGE_ORDER.index("solution")
+                continue
+
+        # Checkpoint after "review"
+        if stage_name == "review":
+            decision = confirm_checkpoint("review", state.review_report or "", config.skip_checkpoints)
+            if decision.decision == CheckpointDecision.REJECT:
+                if retry_counts["review"] >= MAX_RETRY:
+                    raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'review'. Pipeline terminated.")
+                retry_counts["review"] += 1
+                _log.warning("Review rejected (attempt %d). Retrying code_gen.", retry_counts["review"])
+                state.code_diff = None
+                state.test_code = None
+                state.review_report = None
+                state.final_output = None
+                # Jump back to code_gen
+                stage_idx = STAGE_ORDER.index("code_gen")
+                continue
+
+        stage_idx += 1
 
     _log.info(
         "\n═══════════════════════════════════════════════════════\n"
