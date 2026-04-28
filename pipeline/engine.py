@@ -1,16 +1,35 @@
 """
 Pipeline engine for the DevFlow Engine.
 
-Sequentially executes the 6 stages, passing state between them.
+Sequentially executes the 6 stages using LangChain SequentialChain.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
+from langchain.chains import SequentialChain
+
 from pipeline.models import PipelineConfig, PipelineState, StageInput, StageOutput
+from chains import (
+    create_requirements_chain,
+    create_solution_chain,
+    create_code_gen_chain,
+    create_test_gen_chain,
+    create_review_chain,
+    create_delivery_chain,
+)
+from agents import (
+    run_requirements,
+    run_solution,
+    run_code_gen,
+    run_test_gen,
+    run_review,
+    run_delivery,
+)
 
 _log = logging.getLogger("pipeline.engine")
 
@@ -26,7 +45,7 @@ STAGE_ORDER = [
 
 async def run(input_text: str, config: PipelineConfig) -> PipelineState:
     """
-    Run the full pipeline.
+    Run the full pipeline using LangChain SequentialChain.
 
     Args:
         input_text: The user's raw requirement string.
@@ -84,23 +103,14 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
 
 
 def _get_agent(stage_name: str):
-    """Get the agent function for a stage."""
-    from agents import (
-        requirements_agent,
-        solution_agent,
-        code_gen_agent,
-        test_gen_agent,
-        review_agent,
-        delivery_agent,
-    )
-
+    """Get the agent async function for a stage."""
     agents = {
-        "requirements": requirements_agent,
-        "solution": solution_agent,
-        "code_gen": code_gen_agent,
-        "test_gen": test_gen_agent,
-        "review": review_agent,
-        "delivery": delivery_agent,
+        "requirements": run_requirements,
+        "solution": run_solution,
+        "code_gen": run_code_gen,
+        "test_gen": run_test_gen,
+        "review": run_review,
+        "delivery": run_delivery,
     }
     return agents.get(stage_name)
 
@@ -143,7 +153,8 @@ async def _write_output(output_dir: str, stage_name: str, output: StageOutput) -
     content_path.write_text(output.content, encoding="utf-8")
 
     if output.artifacts:
-        import json
-
         artifacts_path = out_path / f"{stage_name}_artifacts.json"
-        artifacts_path.write_text(json.dumps(output.artifacts, indent=2, ensure_ascii=False), encoding="utf-8")
+        artifacts_path.write_text(
+            json.dumps(output.artifacts, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )

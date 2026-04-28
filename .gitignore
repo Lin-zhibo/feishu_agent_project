@@ -10,3 +10,4 @@ config/model.json
 *cache
 doc/NOTE.md
 log
+util

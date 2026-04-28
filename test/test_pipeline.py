@@ -81,23 +81,23 @@ class TestPipelineConfig:
 class TestAgentsMocked:
     @pytest.mark.asyncio
     async def test_requirements_agent_mocked(self, mock_config: PipelineConfig) -> None:
-        from agents.requirements import run
+        from agents import run_requirements
+        from unittest.mock import MagicMock
 
-        mock_response = AsyncMock()
-        mock_response.choices = [AsyncMock(message=AsyncMock(content="# Requirements Doc"))]
+        mock_response = MagicMock()
+        mock_response.content = "# Requirements Doc"
 
-        with patch("openai.AsyncOpenAI") as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-            mock_client_class.return_value = mock_client
+        mock_chain = MagicMock()
+        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
 
+        with patch("agents.create_requirements_chain", return_value=mock_chain):
             inp = StageInput(
                 stage_name="requirements",
                 previous_output=None,
                 current_input="user login",
                 config=mock_config,
             )
-            out = await run(inp)
+            out = await run_requirements(inp)
 
             assert out.stage_name == "requirements"
             assert "# Requirements Doc" in out.content
@@ -105,30 +105,183 @@ class TestAgentsMocked:
 
     @pytest.mark.asyncio
     async def test_solution_agent_mocked(self, mock_config: PipelineConfig) -> None:
-        from agents.solution import run
+        from agents import run_solution
+        from unittest.mock import MagicMock
 
-        mock_response = AsyncMock()
-        mock_response.choices = [AsyncMock(message=AsyncMock(content="## Technical Solution"))]
+        mock_response = MagicMock()
+        mock_response.content = "## Technical Solution"
 
-        with patch("openai.AsyncOpenAI") as mock_client_class:
-            mock_client = AsyncMock()
-            mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-            mock_client_class.return_value = mock_client
+        mock_chain = MagicMock()
+        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
 
+        with patch("agents.create_solution_chain", return_value=mock_chain):
             inp = StageInput(
                 stage_name="solution",
                 previous_output={"requirements": "# Requirements"},
                 current_input="# Requirements",
                 config=mock_config,
             )
-            out = await run(inp)
+            out = await run_solution(inp)
 
             assert out.stage_name == "solution"
             assert "## Technical Solution" in out.content
 
-# Note: engine-level integration test with real stage ordering is intentionally
-# omitted here because stage-to-stage state passing is exercised via
-# individual agent tests above. The engine test would require patching
-# the import-time binding in _get_agent(), which is fragile; instead the
-# end-to-end flow is verified via `python cli.py --input "..." --skip-*` once
-# a real API key is configured.
+    @pytest.mark.asyncio
+    async def test_code_gen_agent_mocked(self, mock_config: PipelineConfig) -> None:
+        from agents import run_code_gen
+        from unittest.mock import MagicMock
+
+        mock_response = MagicMock()
+        mock_response.content = "+ def login():"
+
+        mock_chain = MagicMock()
+        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
+
+        with patch("agents.create_code_gen_chain", return_value=mock_chain):
+            inp = StageInput(
+                stage_name="code_gen",
+                previous_output={"solution": "## Solution"},
+                current_input="## Solution",
+                config=mock_config,
+            )
+            out = await run_code_gen(inp)
+
+            assert out.stage_name == "code_gen"
+            assert "+ def login():" in out.content
+
+    @pytest.mark.asyncio
+    async def test_test_gen_agent_mocked(self, mock_config: PipelineConfig) -> None:
+        from agents import run_test_gen
+        from unittest.mock import MagicMock
+
+        mock_response = MagicMock()
+        mock_response.content = "def test_login():"
+
+        mock_chain = MagicMock()
+        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
+
+        with patch("agents.create_test_gen_chain", return_value=mock_chain):
+            inp = StageInput(
+                stage_name="test_gen",
+                previous_output={"code_diff": "+ def login(): pass"},
+                current_input="+ def login(): pass",
+                config=mock_config,
+            )
+            out = await run_test_gen(inp)
+
+            assert out.stage_name == "test_gen"
+            assert "def test_login():" in out.content
+
+    @pytest.mark.asyncio
+    async def test_review_agent_mocked(self, mock_config: PipelineConfig) -> None:
+        from agents import run_review
+        from unittest.mock import MagicMock
+
+        mock_response = MagicMock()
+        mock_response.content = "## Code Review\n- OK"
+
+        mock_chain = MagicMock()
+        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
+
+        with patch("agents.create_review_chain", return_value=mock_chain):
+            inp = StageInput(
+                stage_name="review",
+                previous_output={"code_diff": "+ def login(): pass"},
+                current_input="+ def login(): pass",
+                config=mock_config,
+            )
+            out = await run_review(inp)
+
+            assert out.stage_name == "review"
+            assert "## Code Review" in out.content
+
+    @pytest.mark.asyncio
+    async def test_delivery_agent_mocked(self, mock_config: PipelineConfig) -> None:
+        from agents import run_delivery
+        from unittest.mock import MagicMock
+
+        mock_response = MagicMock()
+        mock_response.content = "## Delivery Summary"
+
+        mock_chain = MagicMock()
+        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
+
+        with patch("agents.create_delivery_chain", return_value=mock_chain):
+            inp = StageInput(
+                stage_name="delivery",
+                previous_output={
+                    "requirements": "# Req",
+                    "solution": "## Sol",
+                    "code_diff": "+ code",
+                    "test_code": "def test",
+                    "review_report": "## Review",
+                },
+                current_input="",
+                config=mock_config,
+            )
+            out = await run_delivery(inp)
+
+            assert out.stage_name == "delivery"
+            assert "## Delivery Summary" in out.content
+
+
+class TestChainsModule:
+    def test_requirements_chain_creation(self, mock_config: PipelineConfig) -> None:
+        from chains import create_requirements_chain
+
+        chain = create_requirements_chain(mock_config)
+        assert hasattr(chain, "invoke")
+        assert hasattr(chain, "ainvoke")
+
+    def test_solution_chain_creation(self, mock_config: PipelineConfig) -> None:
+        from chains import create_solution_chain
+
+        chain = create_solution_chain(mock_config)
+        assert hasattr(chain, "invoke")
+        assert hasattr(chain, "ainvoke")
+
+    def test_code_gen_chain_creation(self, mock_config: PipelineConfig) -> None:
+        from chains import create_code_gen_chain
+
+        chain = create_code_gen_chain(mock_config)
+        assert hasattr(chain, "invoke")
+        assert hasattr(chain, "ainvoke")
+
+    def test_test_gen_chain_creation(self, mock_config: PipelineConfig) -> None:
+        from chains import create_test_gen_chain
+
+        chain = create_test_gen_chain(mock_config)
+        assert hasattr(chain, "invoke")
+        assert hasattr(chain, "ainvoke")
+
+    def test_review_chain_creation(self, mock_config: PipelineConfig) -> None:
+        from chains import create_review_chain
+
+        chain = create_review_chain(mock_config)
+        assert hasattr(chain, "invoke")
+        assert hasattr(chain, "ainvoke")
+
+    def test_delivery_chain_creation(self, mock_config: PipelineConfig) -> None:
+        from chains import create_delivery_chain
+
+        chain = create_delivery_chain(mock_config)
+        assert hasattr(chain, "invoke")
+        assert hasattr(chain, "ainvoke")
+
+
+class TestPromptsModule:
+    def test_requirements_prompt_variables(self) -> None:
+        from prompts import REQUIREMENTS_PROMPT
+
+        assert "input" in REQUIREMENTS_PROMPT.input_variables
+
+    def test_delivery_prompt_variables(self) -> None:
+        from prompts import DELIVERY_PROMPT
+
+        assert set(DELIVERY_PROMPT.input_variables) == {
+            "req",
+            "solution",
+            "code_diff",
+            "test_code",
+            "review_report",
+        }

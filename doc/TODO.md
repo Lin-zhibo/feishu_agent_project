@@ -2,6 +2,17 @@
 
 ## 已完成
 
+- **LangChain 重构（升级到 RunnableSequence）**：将 Pipeline 从直接调用 `openai.AsyncOpenAI` 改为使用 LangChain
+  - 升级 `LLMChain` → `RunnableSequence`（`prompt | llm` 语法）
+  - 升级 `arun()` → `ainvoke()`（返回 `AIMessage`，需提取 `.content`）
+  - 新增 `prompts/` 模块（6 个 `PromptTemplate`）
+  - 新增 `chains/` 模块（6 个 `LLMChain` 工厂函数）
+  - 重写 `agents/__init__.py`（包装 chains 为 async run 函数）
+  - 删除旧 agent 文件（ReqirementsAnalysis.py 等 6 个）
+  - 删除旧 `prompt/template.py`
+  - 更新 `test/test_pipeline.py`（mock 改为 `MagicMock` + patch 工厂函数）
+  - 19 个测试全部通过
+
 - **最小化 Pipeline 搭建**：完成 6 阶段 Pipeline 的基础结构
   - 新增 `pipeline/` 目录（models.py, engine.py, config_loader.py, __init__.py）
   - 新增 `agents/` 目录（requirements.py, solution.py, code_gen.py, test_gen.py, review.py, delivery.py, __init__.py）
