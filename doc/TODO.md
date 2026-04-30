@@ -28,7 +28,15 @@
   - `_tool_runner.py` 新增 `_call_llm_with_retry()` 指数退避
   - 19 个测试全部通过，ruff 零告警
 
-- **新增 4 个用户配置项 + 删除 stage_enabled**：
+- **新增 AGENTS.md + 子 Agent 系统 (SpawnSubAgent)**：
+  - `AGENTS.md`：~100 行 Agent 行为守则（知识地图 + 子 agent 类型 + 工具规则）
+  - `agents/sub_agent.py`：`run_sub_agent()` — 轻量子 agent 执行器，4 种类型（file-writer / code-reviewer / test-writer / researcher），每种独立 system prompt + 受限工具集
+  - `tools/sub_agent.py`：`SpawnSubAgent` 工具 + `bind_sub_agent_context()` 上下文注入
+  - `prompts/code_gen.py`：指示使用 SpawnSubAgent 逐文件并行创建
+  - `prompts/test_gen.py`：指示 SpawnSubAgent(test-writer) 并行测试
+  - `prompts/review.py`：指示 SpawnSubAgent(code-reviewer) 逐文件审查 + 汇总
+  - 6 个 agents `run_*()` 在调用前绑定子 agent 上下文
+  - 19 个测试全部通过，ruff 零告警
   - `config/settings.json`：新增 `temperature: 0.3` / `max_tool_iterations: 20` / `preserve_session: false` / `verbose: false`；删除 `stage_enabled` 块
   - `pipeline/models.py`：`PipelineConfig` 新增对应 4 个字段
   - `pipeline/config_loader.py`：加载 4 个新字段

@@ -242,4 +242,5 @@ class TestPromptsModule:
             "code_diff",
             "test_code",
             "review_report",
+            "input",
         }

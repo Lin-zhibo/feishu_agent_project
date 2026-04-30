@@ -15,6 +15,7 @@ from langchain_openai import ChatOpenAI
 from pipeline.models import PipelineConfig, StageInput, StageOutput
 from prompts import REQUIREMENTS_PROMPT
 from tools import STAGE_TOOLS
+from tools import ALL_TOOLS, bind_sub_agent_context
 from agents._tool_runner import invoke_agent_with_tools
 
 _log = logging.getLogger("agents.requirements")
@@ -64,6 +65,7 @@ async def run_requirements(
         temperature=inp.config.temperature,
     )
 
+    bind_sub_agent_context(llm, inp.config, inp.workspace, {t.name: t for t in ALL_TOOLS})
     content = await invoke_agent_with_tools(
         prompt_template=REQUIREMENTS_PROMPT,
         llm=llm,

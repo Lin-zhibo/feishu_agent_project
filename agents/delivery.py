@@ -15,6 +15,7 @@ from langchain_openai import ChatOpenAI
 from pipeline.models import PipelineConfig, StageInput, StageOutput
 from prompts import DELIVERY_PROMPT
 from tools import STAGE_TOOLS
+from tools import ALL_TOOLS, bind_sub_agent_context
 from agents._tool_runner import invoke_agent_with_tools
 
 _log = logging.getLogger("agents.delivery")
@@ -66,6 +67,7 @@ async def run_delivery(
         temperature=inp.config.temperature,
     )
 
+    bind_sub_agent_context(llm, inp.config, inp.workspace, {t.name: t for t in ALL_TOOLS})
     content = await invoke_agent_with_tools(
         prompt_template=DELIVERY_PROMPT,
         llm=llm,
@@ -76,6 +78,7 @@ async def run_delivery(
             "code_diff": prev.get("code_diff", ""),
             "test_code": prev.get("test_code", ""),
             "review_report": prev.get("review_report", ""),
+            "input": inp.current_input,
         },
         callbacks=callbacks,
         stream=stream,

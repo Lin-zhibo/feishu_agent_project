@@ -16,6 +16,7 @@ from langchain_openai import ChatOpenAI
 from pipeline.models import PipelineConfig, ReviewDecision, StageInput, StageOutput
 from prompts import REVIEW_PROMPT
 from tools import STAGE_TOOLS
+from tools import ALL_TOOLS, bind_sub_agent_context
 from agents._tool_runner import invoke_agent_with_tools
 
 _log = logging.getLogger("agents.review")
@@ -65,6 +66,7 @@ async def run_review(
         temperature=inp.config.temperature,
     )
 
+    bind_sub_agent_context(llm, inp.config, inp.workspace, {t.name: t for t in ALL_TOOLS})
     content = await invoke_agent_with_tools(
         prompt_template=REVIEW_PROMPT,
         llm=llm,

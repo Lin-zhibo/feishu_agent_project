@@ -12,7 +12,12 @@ SYSTEM = (
 USER = (
     "## Context\n{input}\n\n"
     "## Task\n"
-    "Generate pytest unit tests and integration tests covering the code changes."
+    "Generate tests covering the code changes.\n"
+    "1. Use SpawnSubAgent (agent_type='test-writer') for each test file.\n"
+    "   One sub-agent = one test file.\n"
+    "2. Each test-writer sub-agent will: read the source → write tests → run pytest → fix → verify.\n"
+    "3. After all sub-agents complete, output a summary with test results.\n\n"
+    "IMPORTANT: Use SpawnSubAgent for parallel test creation and execution."
 )
 
 TEST_GEN_PROMPT = PromptTemplate(

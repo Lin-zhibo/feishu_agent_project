@@ -140,16 +140,16 @@ def list_paused(log_dir: str) -> list[dict]:
         if not subdir.is_dir():
             continue
         for f in sorted(subdir.glob("pipeline_*.json")):
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            results.append({
-                "pipeline_id": data["pipeline_id"],
-                "original_input": data["original_input"][:80],
-                "paused_at": data.get("paused_at", ""),
-                "pause_reason": data.get("pause_reason", ""),
-            })
-        except Exception:
-            pass
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                results.append({
+                    "pipeline_id": data["pipeline_id"],
+                    "original_input": data["original_input"][:80],
+                    "paused_at": data.get("paused_at", ""),
+                    "pause_reason": data.get("pause_reason", ""),
+                })
+            except Exception:
+                pass
     return results
 
 

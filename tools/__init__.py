@@ -12,6 +12,7 @@ from tools.file_ops import Edit, Read, Write
 from tools.git_cmd import git_cmd_exec
 from tools.glob import Glob
 from tools.grep import Grep
+from tools.sub_agent import SpawnSubAgent, bind_sub_agent_context
 from tools.tool_search import ToolSearch
 from tools.web_tools import WebFetch, WebSearch
 
@@ -29,8 +30,10 @@ __all__ = [
     "WebFetch",
     "ToolSearch",
     "AskUserQuestion",
+    "SpawnSubAgent",
     "STAGE_TOOLS",
     "ALL_TOOLS",
+    "bind_sub_agent_context",
 ]
 
 # Re-export shell_exec for backward compatibility
@@ -44,6 +47,7 @@ _COMMON: list[BaseTool] = [
     Glob,
     Grep,
     Bash,
+    SpawnSubAgent,
     WebSearch,
     WebFetch,
     ToolSearch,
