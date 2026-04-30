@@ -99,15 +99,36 @@
 - 新增实时可视化回调，输出格式示例：
   - 每个 Stage：`┌─ Stage: requirements ───────────────────── [SUCCESS] ─┐ │ Time: 1,234 ms │ Tokens: prompt=128 | completion=64 | total=192 │ Cumulative: time=1,234ms | tokens=192 └─────────────┘`
   - 汇总：`═══════════════════════════════════════════════════════ Pipeline Summary Total Time: 8,456 ms Total Tokens: prompt=1,024 | completion=512 | total=1,536 ════════════════════════════════════════════════════════`
-- 已实现 10 个工具并集成到相关 stage 的工具集
+- 工具清单 12 个（含 SpawnSubAgent），按 stage 分配
 
 ## 已知问题
 
-- Agent 之间传递的 `previous_output` 目前仅传递 `requirements` 和 `solution`，其他字段依赖 engine 中的累积字典
+- `delivery` prompt 新增 `{input}` 变量（workspace 上下文），已接入
 
 ## 下一步
 
-- [ ] 配置真实 API Key 并端到端测试 `python cli.py --input "用户登录功能"`
-- [ ] 实现输出文件的实际写入逻辑（out/ 目录）
-- [ ] 补充 Agent 间更多上下文传递
-- [ ] 添加集成测试或 E2E 测试
+### 功能一：必须完成项
+
+- [ ] **1.4 API-First 架构**：Golang 实现 RESTful API（12 端点）+ Swagger/OpenAPI 文档
+  - 技术栈：Golang + Gin/Chi + asyncio subprocess 调用 Python engine
+  - 新增 `backend/` 目录（`main.go`, `api/`, `models/`, `registry.go`）
+  - Pipeline 运行时注册表（`registry.go`）管理活跃 Pipeline 生命周期
+  - Checkpoint `input()` → 替换为 `asyncio.Event` 等待 API 审批调用
+  - SSE/轮询 推送 Pipeline 状态变更
+
+- [ ] **1.5 端到端演示**：完整 Pipeline 运行 + workspace 交付可运行代码
+  - 真实 API Key 端到端测试
+  - 验证子 agent 并行文件创建
+  - 验证 workspace 产出可运行代码
+
+### 功能一：可选加分项
+
+- [ ] **1.8 可观测性面板**：前端 WebSocket/SSE 实时可视化 + Token/耗时图表
+- [ ] **1.9 代码库索引**：Semantic 模式（Embedding 语义检索）
+- [ ] **1.10 Pipeline 模板**：Bug 修复 / 新功能 / 重构模板
+- [ ] **1.11 Git 集成**：自动分支 → 提交 → PR（GitHub/GitLab API）
+
+### 功能二
+
+- [ ] 前端 UI 对接后端 API
+- [ ] 注入悬浮对话框 + 圈选 + 热更新 + 自动 MR
