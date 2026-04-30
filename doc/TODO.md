@@ -16,6 +16,14 @@
   - 支持 `1,3,5` 数字索引和 `收入/支出记录, 分类管理` 文本两种输入方式
   - 19 个测试全部通过
 
+- **文件交互工具增强 + 新增 Glob/Grep/Bash**：
+  - `tools/file_ops.py`：`Read` 新增 `offset`/`limit` 参数、二进制检测；`Edit` 新增 `replace_all` 参数
+  - 新增 `tools/glob.py`（`Glob`）：文件模式匹配，自动跳过 .git/node_modules 等目录，限 200 条
+  - 新增 `tools/grep.py`（`Grep`）：正则内容搜索，支持 `include` 文件过滤，限 100 条
+  - 新增 `tools/bash.py`（`Bash`）：增强版 shell_exec，新增 `description`/`workdir`/`timeout`，Y/n 确认
+  - `tools/__init__.py` 重构 stage 工具分配：AskUserQuestion 仅 requirements；git_cmd_exec 仅 delivery；其余全 stage 通用
+  - 19 个测试全部通过，ruff lint 零告警
+
 - **Review 阶段增强**：实现 AI 判断 + 人类审核的两阶段 checkpoint
   - `pipeline/models.py`：新增 `ReviewDecision` 数据结构、`allow_human_override_on_ai_fail` 配置开关
   - `prompts/review.py`：修改 prompt 要求结构化 VERDICT 输出（PASS/FAIL + Reason + Critical Issues）
@@ -62,7 +70,7 @@
 - 新增实时可视化回调，输出格式示例：
   - 每个 Stage：`┌─ Stage: requirements ───────────────────── [SUCCESS] ─┐ │ Time: 1,234 ms │ Tokens: prompt=128 | completion=64 | total=192 │ Cumulative: time=1,234ms | tokens=192 └─────────────┘`
   - 汇总：`═══════════════════════════════════════════════════════ Pipeline Summary Total Time: 8,456 ms Total Tokens: prompt=1,024 | completion=512 | total=1,536 ════════════════════════════════════════════════════════`
-- 已实现 WebSearch、WebFetch、ToolSearch、AskUserQuestion 四个工具并集成到相关 stage 的工具集
+- 已实现 10 个工具并集成到相关 stage 的工具集
 
 ## 已知问题
 
