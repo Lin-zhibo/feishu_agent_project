@@ -2,7 +2,13 @@
 Shell execution tool for LLM agents using LangChain.
 """
 
+from __future__ import annotations
+
+import logging
+
 from langchain_core.tools import tool
+
+_log = logging.getLogger("tools.shell_exec")
 
 
 def _confirm_exec(cmd: str, tool_name: str) -> str | None:
@@ -36,7 +42,9 @@ def shell_exec(cmd: str) -> str:
     Returns:
         stdout output if successful, or error message with stderr if failed.
     """
+    _log.info("shell_exec called: cmd=%s", cmd)
     if denied := _confirm_exec(cmd, "shell_exec"):
+        _log.info("shell_exec: denied by user")
         return denied
 
     import subprocess
@@ -50,6 +58,8 @@ def shell_exec(cmd: str) -> str:
     )
 
     if result.returncode != 0:
+        _log.warning("shell_exec: failed with code %d: %s", result.returncode, result.stderr.strip())
         return f"Command failed with code {result.returncode}:\n{result.stderr.strip()}"
 
+    _log.info("shell_exec: done, stdout_chars=%d", len(result.stdout.strip()))
     return result.stdout.strip()

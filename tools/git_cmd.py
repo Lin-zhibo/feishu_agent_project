@@ -2,7 +2,13 @@
 git command execution tool for LLM agents using LangChain.
 """
 
+from __future__ import annotations
+
+import logging
+
 from langchain_core.tools import tool
+
+_log = logging.getLogger("tools.git_cmd")
 
 
 def _confirm_exec(cmd: str, tool_name: str) -> str | None:
@@ -35,10 +41,13 @@ def git_cmd_exec(cmd: str) -> str:
     Returns:
         stdout output if successful, or error message with stderr if failed.
     """
+    _log.info("git_cmd_exec called: cmd=%s", cmd)
     if not cmd.startswith("git "):
+        _log.warning("git_cmd_exec: invalid command (not git): %s", cmd)
         return f"{cmd} is not a valid git command."
 
     if denied := _confirm_exec(cmd, "git_cmd"):
+        _log.info("git_cmd_exec: denied by user")
         return denied
 
     import subprocess
@@ -52,6 +61,8 @@ def git_cmd_exec(cmd: str) -> str:
     )
 
     if result.returncode != 0:
+        _log.warning("git_cmd_exec: failed with code %d: %s", result.returncode, result.stderr.strip())
         return f"Command failed with code {result.returncode}:\n{result.stderr.strip()}"
 
+    _log.info("git_cmd_exec: done, stdout_chars=%d", len(result.stdout.strip()))
     return result.stdout.strip()

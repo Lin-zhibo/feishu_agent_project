@@ -2,6 +2,20 @@
 
 ## 已完成
 
+- **修复工具调用循环缺失 + DeepSeek reasoning_content 400 错误**：重构 agent loop，使用原生 API dict 消息格式
+  - 新增 `agents/_tool_runner.py`（使用 `llm.async_client` + 纯 dict 消息 + `model_dump()` 保留所有 provider 专有字段）
+  - 修改 6 个 `agents/*.py`（`run_*()` 均使用新 utility）
+  - 修改 `test/test_pipeline.py`（mock `invoke_agent_with_tools`）
+  - 解决已知问题：#1 requirements 阶段输出残缺、#2 astream() 工具调用失效
+  - 修复：reasoning_content 在工具调用后第二轮请求时丢失导致 400 错误（DeepSeek thinking mode 兼容）
+  - 通用方案：不绑定任何单一 provider，任何 OpenAI 兼容 API 的专有字段均可完整保留
+
+- **AskUserQuestion 多选支持**：新增 `multiselect` 参数，支持编号多选
+  - `tools/ask_user.py`：新增 `multiselect: bool = False` 参数 + `_parse_multiselect()` 解析函数
+  - 多选时显示编号列表，用户输入逗号分隔的数字或选项文本
+  - 支持 `1,3,5` 数字索引和 `收入/支出记录, 分类管理` 文本两种输入方式
+  - 19 个测试全部通过
+
 - **Review 阶段增强**：实现 AI 判断 + 人类审核的两阶段 checkpoint
   - `pipeline/models.py`：新增 `ReviewDecision` 数据结构、`allow_human_override_on_ai_fail` 配置开关
   - `prompts/review.py`：修改 prompt 要求结构化 VERDICT 输出（PASS/FAIL + Reason + Critical Issues）
@@ -41,28 +55,21 @@
 ## 当前状态
 
 - Pipeline 基础架构已完整搭建，CLI 可运行
-- 6 个 Agent 已实现，均调用 DeepSeek API
-- 测试覆盖：models 创建、config 验证、Agent mock 测试
+- 6 个 Agent 均使用 `invoke_agent_with_tools()` 实现工具调用循环
+- Agent loop 使用原生 `llm.async_client` API 调用 + 纯 dict 消息格式，保证所有 provider 专有字段（如 reasoning_content）完整保留
+- 每个 agent 使用各自 stage 的专属工具集（`STAGE_TOOLS[stage_name]`）
+- 测试覆盖：models 创建、config 验证、Agent mock 测试、chain 创建、prompt 变量
 - 新增实时可视化回调，输出格式示例：
   - 每个 Stage：`┌─ Stage: requirements ───────────────────── [SUCCESS] ─┐ │ Time: 1,234 ms │ Tokens: prompt=128 | completion=64 | total=192 │ Cumulative: time=1,234ms | tokens=192 └─────────────┘`
   - 汇总：`═══════════════════════════════════════════════════════ Pipeline Summary Total Time: 8,456 ms Total Tokens: prompt=1,024 | completion=512 | total=1,536 ════════════════════════════════════════════════════════`
-- 已实现 WebSearch、WebFetch、ToolSearch、AskUserQuestion 四个工具并集成到 LangChain chains
+- 已实现 WebSearch、WebFetch、ToolSearch、AskUserQuestion 四个工具并集成到相关 stage 的工具集
 
 ## 已知问题
 
-- **astream() 工具调用失效**：code_gen 使用 astream() 时只输出描述性文本（如 "I'll start by examining..."），没有真正调用工具生成代码
-  - 原因：astream() 在工具调用时可能不会正确处理中间输出
-  - 状态：未解决，可能需要回退到 ainvoke()
-- **requirements 阶段输出残缺**：LLM 调用 AskUserQuestion 工具时只返回开场白，内容不完整
-  - 原因：工具调用时 output.content 可能为空
-  - 状态：未解决
-- 需要真实 API Key 才能端到端运行（当前配置从 config/model.json 读取）
 - Agent 之间传递的 `previous_output` 目前仅传递 `requirements` 和 `solution`，其他字段依赖 engine 中的累积字典
 
 ## 下一步
 
-- [ ] 修复 astream() 工具调用失效问题（考虑回退到 ainvoke()）
-- [ ] 修复 requirements 阶段输出残缺问题
 - [ ] 配置真实 API Key 并端到端测试 `python cli.py --input "用户登录功能"`
 - [ ] 实现输出文件的实际写入逻辑（out/ 目录）
 - [ ] 补充 Agent 间更多上下文传递

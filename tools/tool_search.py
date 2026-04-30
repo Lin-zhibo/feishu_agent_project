@@ -8,9 +8,12 @@ for a given task.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from langchain_core.tools import tool
+
+_log = logging.getLogger("tools.tool_search")
 
 # In-memory registry of all tools
 # Each entry: {name, description, module}
@@ -40,8 +43,10 @@ def ToolSearch(query: str) -> str:
     Returns:
         JSON string listing matching tools with their names, descriptions, and modules.
     """
+    _log.info("ToolSearch called: query=%s", query)
     q = query.lower().strip()
     if not q:
+        _log.info("ToolSearch: empty query, returning full registry")
         return json.dumps(_TOOL_REGISTRY, indent=2, ensure_ascii=False)
 
     results = [
@@ -50,9 +55,11 @@ def ToolSearch(query: str) -> str:
     ]
 
     if not results:
+        _log.info("ToolSearch: no results for query=%s", query)
         return json.dumps(
             [{"note": f"No tools found matching '{query}'. Try different keywords."}],
             indent=2,
         )
 
+    _log.info("ToolSearch: query=%s, results_count=%d", query, len(results))
     return json.dumps(results, indent=2, ensure_ascii=False)

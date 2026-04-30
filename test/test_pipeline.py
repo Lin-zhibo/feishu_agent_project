@@ -4,7 +4,7 @@ Smoke tests for the DevFlow Engine pipeline.
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -82,15 +82,8 @@ class TestAgentsMocked:
     @pytest.mark.asyncio
     async def test_requirements_agent_mocked(self, mock_config: PipelineConfig) -> None:
         from agents import run_requirements
-        from unittest.mock import MagicMock
 
-        mock_response = MagicMock()
-        mock_response.content = "# Requirements Doc"
-
-        mock_chain = MagicMock()
-        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
-
-        with patch("agents.create_requirements_chain", return_value=mock_chain):
+        with patch("agents.requirements.invoke_agent_with_tools", return_value="# Requirements Doc"):
             inp = StageInput(
                 stage_name="requirements",
                 previous_output=None,
@@ -106,15 +99,8 @@ class TestAgentsMocked:
     @pytest.mark.asyncio
     async def test_solution_agent_mocked(self, mock_config: PipelineConfig) -> None:
         from agents import run_solution
-        from unittest.mock import MagicMock
 
-        mock_response = MagicMock()
-        mock_response.content = "## Technical Solution"
-
-        mock_chain = MagicMock()
-        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
-
-        with patch("agents.create_solution_chain", return_value=mock_chain):
+        with patch("agents.solution.invoke_agent_with_tools", return_value="## Technical Solution"):
             inp = StageInput(
                 stage_name="solution",
                 previous_output={"requirements": "# Requirements"},
@@ -129,15 +115,8 @@ class TestAgentsMocked:
     @pytest.mark.asyncio
     async def test_code_gen_agent_mocked(self, mock_config: PipelineConfig) -> None:
         from agents import run_code_gen
-        from unittest.mock import MagicMock
 
-        mock_response = MagicMock()
-        mock_response.content = "+ def login():"
-
-        mock_chain = MagicMock()
-        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
-
-        with patch("agents.create_code_gen_chain", return_value=mock_chain):
+        with patch("agents.code_gen.invoke_agent_with_tools", return_value="+ def login():"):
             inp = StageInput(
                 stage_name="code_gen",
                 previous_output={"solution": "## Solution"},
@@ -152,15 +131,8 @@ class TestAgentsMocked:
     @pytest.mark.asyncio
     async def test_test_gen_agent_mocked(self, mock_config: PipelineConfig) -> None:
         from agents import run_test_gen
-        from unittest.mock import MagicMock
 
-        mock_response = MagicMock()
-        mock_response.content = "def test_login():"
-
-        mock_chain = MagicMock()
-        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
-
-        with patch("agents.create_test_gen_chain", return_value=mock_chain):
+        with patch("agents.test_gen.invoke_agent_with_tools", return_value="def test_login():"):
             inp = StageInput(
                 stage_name="test_gen",
                 previous_output={"code_diff": "+ def login(): pass"},
@@ -175,15 +147,8 @@ class TestAgentsMocked:
     @pytest.mark.asyncio
     async def test_review_agent_mocked(self, mock_config: PipelineConfig) -> None:
         from agents import run_review
-        from unittest.mock import MagicMock
 
-        mock_response = MagicMock()
-        mock_response.content = "## Code Review\n- OK"
-
-        mock_chain = MagicMock()
-        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
-
-        with patch("agents.create_review_chain", return_value=mock_chain):
+        with patch("agents.review.invoke_agent_with_tools", return_value="## Code Review\n- OK"):
             inp = StageInput(
                 stage_name="review",
                 previous_output={"code_diff": "+ def login(): pass"},
@@ -198,15 +163,8 @@ class TestAgentsMocked:
     @pytest.mark.asyncio
     async def test_delivery_agent_mocked(self, mock_config: PipelineConfig) -> None:
         from agents import run_delivery
-        from unittest.mock import MagicMock
 
-        mock_response = MagicMock()
-        mock_response.content = "## Delivery Summary"
-
-        mock_chain = MagicMock()
-        mock_chain.ainvoke = AsyncMock(return_value=mock_response)
-
-        with patch("agents.create_delivery_chain", return_value=mock_chain):
+        with patch("agents.delivery.invoke_agent_with_tools", return_value="## Delivery Summary"):
             inp = StageInput(
                 stage_name="delivery",
                 previous_output={
@@ -227,42 +185,42 @@ class TestAgentsMocked:
 
 class TestChainsModule:
     def test_requirements_chain_creation(self, mock_config: PipelineConfig) -> None:
-        from chains import create_requirements_chain
+        from agents import create_requirements_chain
 
         chain = create_requirements_chain(mock_config)
         assert hasattr(chain, "invoke")
         assert hasattr(chain, "ainvoke")
 
     def test_solution_chain_creation(self, mock_config: PipelineConfig) -> None:
-        from chains import create_solution_chain
+        from agents import create_solution_chain
 
         chain = create_solution_chain(mock_config)
         assert hasattr(chain, "invoke")
         assert hasattr(chain, "ainvoke")
 
     def test_code_gen_chain_creation(self, mock_config: PipelineConfig) -> None:
-        from chains import create_code_gen_chain
+        from agents import create_code_gen_chain
 
         chain = create_code_gen_chain(mock_config)
         assert hasattr(chain, "invoke")
         assert hasattr(chain, "ainvoke")
 
     def test_test_gen_chain_creation(self, mock_config: PipelineConfig) -> None:
-        from chains import create_test_gen_chain
+        from agents import create_test_gen_chain
 
         chain = create_test_gen_chain(mock_config)
         assert hasattr(chain, "invoke")
         assert hasattr(chain, "ainvoke")
 
     def test_review_chain_creation(self, mock_config: PipelineConfig) -> None:
-        from chains import create_review_chain
+        from agents import create_review_chain
 
         chain = create_review_chain(mock_config)
         assert hasattr(chain, "invoke")
         assert hasattr(chain, "ainvoke")
 
     def test_delivery_chain_creation(self, mock_config: PipelineConfig) -> None:
-        from chains import create_delivery_chain
+        from agents import create_delivery_chain
 
         chain = create_delivery_chain(mock_config)
         assert hasattr(chain, "invoke")

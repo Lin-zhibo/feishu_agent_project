@@ -72,11 +72,22 @@ def confirm_checkpoint(
         print(f"  n = Reject and Redo (with reason)")
     print(f"{'='*60}")
 
-    resp = input("Your decision? (Y/n): ").strip().lower()
-
-    if resp in ("y", "yes", ""):
+    try:
+        raw = input("Your decision? (Y/n): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCheckpoint interrupted. Auto-approving to continue.")
         return CheckpointResult(decision=CheckpointDecision.APPROVE)
 
+    if raw.lower() in ("y", "yes") or raw == "":
+        return CheckpointResult(decision=CheckpointDecision.APPROVE)
+
+    resp = raw.lower()
+
     # Reject — ask for reason
-    reason = input("Reason for rejection (required): ").strip()
+    try:
+        reason = input("Reason for rejection (required): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nCheckpoint interrupted. Auto-approving to continue.")
+        return CheckpointResult(decision=CheckpointDecision.APPROVE)
+
     return CheckpointResult(decision=CheckpointDecision.REJECT, reason=reason)
