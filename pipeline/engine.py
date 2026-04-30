@@ -47,21 +47,21 @@ STAGE_ORDER = [
 # Pause / Resume — state serialization
 # ---------------------------------------------------------------------------
 
-def _pause_file(output_dir: str, pipeline_id: str) -> Path:
+def _pause_file(log_dir: str, pipeline_id: str) -> Path:
     """Return the path to the pause file for a given pipeline ID."""
-    return Path(output_dir) / f"pipeline_{pipeline_id}.json"
+    return Path(log_dir) / pipeline_id / f"pipeline_{pipeline_id}.json"
 
 
 def _save_paused_state(
     state: PipelineState,
-    output_dir: str,
+    log_dir: str,
     stage_idx: int,
     reason: str,
 ) -> None:
     """Serialize PipelineState to disk for later resume."""
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    pause_path = _pause_file(output_dir, state.pipeline_id)
+    log_path = Path(log_dir) / state.pipeline_id
+    log_path.mkdir(parents=True, exist_ok=True)
+    pause_path = _pause_file(log_dir, state.pipeline_id)
     data = {
         "pipeline_id": state.pipeline_id,
         "original_input": state.original_input,
@@ -83,9 +83,9 @@ def _save_paused_state(
     _log.info("Pipeline state saved to %s", pause_path)
 
 
-def _load_paused_state(output_dir: str, pipeline_id: str) -> tuple[PipelineState, int]:
+def _load_paused_state(log_dir: str, pipeline_id: str) -> tuple[PipelineState, int]:
     """Load a paused PipelineState from disk. Returns (state, stage_idx)."""
-    pause_path = _pause_file(output_dir, pipeline_id)
+    pause_path = _pause_file(log_dir, pipeline_id)
     if not pause_path.exists():
         raise FileNotFoundError(f"Paused pipeline not found: {pause_path}")
     data = json.loads(pause_path.read_text(encoding="utf-8"))
@@ -116,27 +116,30 @@ def _load_paused_state(output_dir: str, pipeline_id: str) -> tuple[PipelineState
     return state, stage_idx
 
 
-def _delete_paused_state(output_dir: str, pipeline_id: str) -> bool:
+def _delete_paused_state(log_dir: str, pipeline_id: str) -> bool:
     """Delete a paused pipeline file. Returns True if deleted."""
-    pause_path = _pause_file(output_dir, pipeline_id)
+    pause_path = _pause_file(log_dir, pipeline_id)
     if pause_path.exists():
         pause_path.unlink()
         return True
     return False
 
 
-def _cleanup_paused_state(state: PipelineState, output_dir: str) -> None:
+def _cleanup_paused_state(state: PipelineState, log_dir: str) -> None:
     """Remove pause file after successful pipeline completion."""
-    _delete_paused_state(output_dir, state.pipeline_id)
+    _delete_paused_state(log_dir, state.pipeline_id)
 
 
-def list_paused(output_dir: str) -> list[dict]:
-    """List all paused pipelines in the output directory."""
-    out_path = Path(output_dir)
-    if not out_path.exists():
+def list_paused(log_dir: str) -> list[dict]:
+    """List all paused pipelines in the log directory."""
+    log_root = Path(log_dir)
+    if not log_root.exists():
         return []
     results = []
-    for f in sorted(out_path.glob("pipeline_*.json")):
+    for subdir in sorted(log_root.iterdir()):
+        if not subdir.is_dir():
+            continue
+        for f in sorted(subdir.glob("pipeline_*.json")):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
             results.append({
@@ -150,15 +153,18 @@ def list_paused(output_dir: str) -> list[dict]:
     return results
 
 
-def terminate_all_paused(output_dir: str) -> int:
+def terminate_all_paused(log_dir: str) -> int:
     """Delete all paused pipeline files. Returns count of deleted files."""
-    out_path = Path(output_dir)
-    if not out_path.exists():
+    log_root = Path(log_dir)
+    if not log_root.exists():
         return 0
     count = 0
-    for f in out_path.glob("pipeline_*.json"):
-        f.unlink()
-        count += 1
+    for subdir in log_root.iterdir():
+        if not subdir.is_dir():
+            continue
+        for f in subdir.glob("pipeline_*.json"):
+            f.unlink()
+            count += 1
     return count
 
 
@@ -189,7 +195,7 @@ def _try_pause(
         reason = (
             f"Time budget exceeded: {handler.total_time_ms:,.0f}ms >= {config.max_total_time_ms:,}ms"
         )
-        _save_paused_state(state, config.output_dir, stage_idx, reason)
+        _save_paused_state(state, config.log_dir, stage_idx, reason)
         print(f"\n{'='*60}")
         print("  PIPELINE PAUSED")
         print(f"{'='*60}")
@@ -204,7 +210,7 @@ def _try_pause(
         reason = (
             f"Token budget exceeded: {handler.total_tokens:,} >= {config.max_total_tokens:,}"
         )
-        _save_paused_state(state, config.output_dir, stage_idx, reason)
+        _save_paused_state(state, config.log_dir, stage_idx, reason)
         print(f"\n{'='*60}")
         print("  PIPELINE PAUSED")
         print(f"{'='*60}")
@@ -234,6 +240,11 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
         PipelineState with all stage outputs filled in.
     """
     pipeline_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    workspace_dir = str(Path(config.workspace).resolve() / pipeline_id)
+    log_dir = str(Path(config.log_dir).resolve() / pipeline_id)
+    Path(workspace_dir).mkdir(parents=True, exist_ok=True)
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+
     state = PipelineState(original_input=input_text, pipeline_id=pipeline_id)
     previous_output: dict | None = None
 
@@ -256,7 +267,7 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
             stage_idx += 1
             continue
 
-        current_input = _get_current_input(stage_name, input_text, state)
+        current_input = _get_current_input(stage_name, input_text, state, workspace_dir)
         _log.info("Stage '%s' starting, input length=%d", stage_name, len(current_input))
 
         inp = StageInput(
@@ -264,6 +275,7 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
             previous_output=previous_output,
             current_input=current_input,
             config=config,
+            workspace=workspace_dir,
         )
 
         handler.stage_name = stage_name
@@ -283,15 +295,15 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
             "review_report": state.review_report or "",
         }
 
-        await _write_output(config.output_dir, stage_name, output)
-        _log.info("Stage '%s' artifacts written to '%s/'", stage_name, config.output_dir)
+        await _write_output(log_dir, stage_name, output)
+        _log.info("Stage '%s' artifacts written to '%s/'", stage_name, log_dir)
 
         # Print full stage output to console
-        _print_stage_output(stage_name, output, config.output_dir)
+        _print_stage_output(stage_name, output, log_dir)
 
         # Checkpoint after "solution"
         if stage_name == "solution":
-            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, config.output_dir)
+            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, log_dir)
             if decision.decision == CheckpointDecision.REJECT:
                 if _try_pause(handler, config, state, stage_idx):
                     _log.info("Pipeline paused after solution checkpoint rejection")
@@ -304,7 +316,6 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
                 state.review_report = None
                 state.final_output = None
                 state.human_feedback = decision.reason or "No reason provided"
-                # Jump back to solution
                 stage_idx = STAGE_ORDER.index("solution")
                 continue
             else:
@@ -315,7 +326,6 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
             rd = state.review_decision
 
             if rd and not rd.passed:
-                # AI FAIL → auto retry code_gen (human never sees this)
                 if _try_pause(handler, config, state, stage_idx):
                     _log.info("Pipeline paused after AI FAIL auto-retry")
                     state.current_stage_idx = stage_idx
@@ -336,17 +346,15 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
                 stage_idx = STAGE_ORDER.index("code_gen")
                 continue
 
-            # AI PASS → human checkpoint
             decision = confirm_checkpoint(
                 "review",
                 state.review_report or "",
                 config.skip_checkpoints,
-                config.output_dir,
+                log_dir,
                 review_decision=rd,
             )
 
             if decision.decision == CheckpointDecision.REJECT:
-                # Human rejected AI PASS → retry review with stricter criteria
                 if _try_pause(handler, config, state, stage_idx):
                     _log.info("Pipeline paused after review human rejection")
                     state.current_stage_idx = stage_idx
@@ -368,9 +376,9 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
         stage_idx += 1
 
     if not config.preserve_session:
-        _cleanup_paused_state(state, config.output_dir)
+        _cleanup_paused_state(state, config.log_dir)
     else:
-        _log.info("preserve_session=true, keeping pause file %s", _pause_file(config.output_dir, state.pipeline_id))
+        _log.info("preserve_session=true, keeping pause file")
 
     _log.info(
         "\n═══════════════════════════════════════════════════════\n"
@@ -401,8 +409,13 @@ async def resume(pipeline_id: str, config: PipelineConfig) -> PipelineState:
     Raises:
         FileNotFoundError: If paused pipeline file does not exist.
     """
-    state, stage_idx = _load_paused_state(config.output_dir, pipeline_id)
+    state, stage_idx = _load_paused_state(config.log_dir, pipeline_id)
     _log.info("Resuming pipeline '%s' from stage %d (%s)", pipeline_id, stage_idx, STAGE_ORDER[stage_idx])
+
+    workspace_dir = str(Path(config.workspace).resolve() / pipeline_id)
+    log_dir = str(Path(config.log_dir).resolve() / pipeline_id)
+    Path(workspace_dir).mkdir(parents=True, exist_ok=True)
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*60}")
     print(f"  RESUMING PIPELINE: {pipeline_id}")
@@ -438,14 +451,14 @@ async def resume(pipeline_id: str, config: PipelineConfig) -> PipelineState:
             stage_idx += 1
             continue
 
-        current_input = _get_current_input(stage_name, state.original_input, state)
-        _log.info("Stage '%s' starting (resume), input length=%d", stage_name, len(current_input))
+        current_input = _get_current_input(stage_name, state.original_input, state, workspace_dir)
 
         inp = StageInput(
             stage_name=stage_name,
             previous_output=previous_output,
             current_input=current_input,
             config=config,
+            workspace=workspace_dir,
         )
 
         handler.stage_name = stage_name
@@ -460,12 +473,12 @@ async def resume(pipeline_id: str, config: PipelineConfig) -> PipelineState:
             "review_report": state.review_report or "",
         }
 
-        await _write_output(config.output_dir, stage_name, output)
-        _print_stage_output(stage_name, output, config.output_dir)
+        await _write_output(log_dir, stage_name, output)
+        _print_stage_output(stage_name, output, log_dir)
 
         # Checkpoint after "solution"
         if stage_name == "solution":
-            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, config.output_dir)
+            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, log_dir)
             if decision.decision == CheckpointDecision.REJECT:
                 if _try_pause(handler, config, state, stage_idx):
                     _log.info("Pipeline paused after solution checkpoint rejection (resume)")
@@ -504,7 +517,7 @@ async def resume(pipeline_id: str, config: PipelineConfig) -> PipelineState:
 
             decision = confirm_checkpoint(
                 "review", state.review_report or "", config.skip_checkpoints,
-                config.output_dir, review_decision=rd,
+                log_dir, review_decision=rd,
             )
 
             if decision.decision == CheckpointDecision.REJECT:
@@ -527,9 +540,9 @@ async def resume(pipeline_id: str, config: PipelineConfig) -> PipelineState:
         stage_idx += 1
 
     if not config.preserve_session:
-        _cleanup_paused_state(state, config.output_dir)
+        _cleanup_paused_state(state, config.log_dir)
     else:
-        _log.info("preserve_session=true, keeping pause file %s", _pause_file(config.output_dir, state.pipeline_id))
+        _log.info("preserve_session=true, keeping pause file")
     _log.info("Pipeline resumed and finished")
     return state
 
@@ -551,10 +564,54 @@ def _get_agent(stage_name: str):
     return agents.get(stage_name)
 
 
-def _get_current_input(stage_name: str, original_input: str, state: PipelineState) -> str:
-    """Determine the current_input for a stage."""
+def _get_current_input(stage_name: str, original_input: str, state: PipelineState, workspace_dir: str = "") -> str:
+    """Determine the current_input for a stage. Embeds workspace context where relevant."""
     if stage_name == "requirements":
         return original_input
+    if stage_name == "solution":
+        base = state.requirements or ""
+        if state.human_feedback:
+            return (
+                base
+                + "\n\n---\n## 人类反馈（上一版被拒绝）\n"
+                + f"拒绝理由：{state.human_feedback}\n"
+                + "请基于以上反馈重新设计方案，解决指出的问题。"
+            )
+        return base
+
+    if stage_name == "code_gen":
+        base = (
+            "## Working Directory\n" + workspace_dir
+            + "\n\n## Solution Design\n" + (state.solution or "")
+        )
+        if state.human_feedback:
+            return base + "\n\n---\n## 反馈\n" + state.human_feedback
+        return base
+
+    if stage_name == "test_gen":
+        base = (
+            "## Working Directory\n" + workspace_dir
+            + "\n\n## Solution Design\n" + (state.solution or "")
+            + "\n\n## Code Changes\n" + (state.code_diff or "")
+        )
+        if state.human_feedback:
+            return base + "\n\n---\n## 反馈\n" + state.human_feedback
+        return base
+
+    if stage_name == "review":
+        base = (
+            "## Working Directory\n" + workspace_dir
+            + "\n\n## Solution Design\n" + (state.solution or "")
+            + "\n\n## Code Diff\n" + (state.code_diff or "")
+            + "\n\n## Test Code\n" + (state.test_code or "")
+        )
+        if state.human_feedback:
+            return base + "\n\n---\n## 反馈\n" + state.human_feedback
+        return base
+
+    if stage_name == "delivery":
+        return "## Working Directory\n" + workspace_dir + "\n\nFiles are in the workspace above."
+    return original_input
     if stage_name == "solution":
         base = state.requirements or ""
         if state.human_feedback:

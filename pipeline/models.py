@@ -59,12 +59,14 @@ class StageInput:
         previous_output: Output from the previous stage, or None if first stage.
         current_input: The text/content to process (user requirement or previous output).
         config: Global pipeline configuration.
+        workspace: Absolute path of the pipeline's working directory.
     """
 
     stage_name: str
     previous_output: dict[str, Any] | None
     current_input: str
     config: "PipelineConfig"
+    workspace: str = ""
 
 
 @dataclass
@@ -156,3 +158,5 @@ class PipelineConfig:
     max_tool_iterations: int = 20   # Max tool-calling loop iterations per stage
     preserve_session: bool = False  # Keep pause file after completion (for audit)
     verbose: bool = False           # Log full LLM request/response content
+    workspace: str = "./out"        # Root workspace dir (pipeline creates ./out/<id>/ subdir)
+    log_dir: str = "tmp"            # Root log dir (stage .md outputs, pause files go here)

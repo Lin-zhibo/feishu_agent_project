@@ -1,5 +1,13 @@
 # DevFlow Engine：基于 AI 驱动的需求交付流程引擎
 
+## introduction
+
+这是一个Agent框架，你提出你的要求，LLM给你一个成功
+
+**输入：**你的小巧思
+
+**输出：**一个完整可运行的项目
+
 ## directory
 
 ```
@@ -176,3 +184,10 @@ flowchart TB
 | PASS | REJECT | → 重新 review |
 | FAIL | REJECT | → code_gen |
 
+
+
+---
+
+
+
+*You Only Tell Once, Token Is All You Need*

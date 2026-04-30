@@ -1,5 +1,6 @@
 {
-    "output_dir": "out",
+    "workspace": "./out",
+    "log_dir": "tmp",
     "skip_checkpoints": false,
     "max_total_time_ms": 600000,
     "max_total_tokens": 50000,
