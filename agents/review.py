@@ -62,7 +62,7 @@ async def run_review(
         model=inp.config.model_name,
         api_key=inp.config.api_key,
         base_url=inp.config.base_url,
-        temperature=0.3,
+        temperature=inp.config.temperature,
     )
 
     content = await invoke_agent_with_tools(
@@ -72,6 +72,9 @@ async def run_review(
         inputs={"input": inp.current_input},
         callbacks=callbacks,
         stream=stream,
+        max_retry=inp.config.max_retry,
+        max_tool_iterations=inp.config.max_tool_iterations,
+        verbose=inp.config.verbose,
     )
 
     review_decision = _parse_review_decision(content)

@@ -34,7 +34,13 @@ def load_settings(settings_path: str | Path) -> PipelineConfig:
         base_url="https://api.deepseek.com",
         output_dir=raw.get("output_dir", "out"),
         skip_checkpoints=raw.get("skip_checkpoints", False),
-        allow_human_override_on_ai_fail=raw.get("allow_human_override_on_ai_fail", False),
+        max_total_time_ms=raw.get("max_total_time_ms", 600000),
+        max_total_tokens=raw.get("max_total_tokens", 50000),
+        max_retry=raw.get("max_retry", 3),
+        temperature=raw.get("temperature", 0.3),
+        max_tool_iterations=raw.get("max_tool_iterations", 20),
+        preserve_session=raw.get("preserve_session", False),
+        verbose=raw.get("verbose", False),
         stage_enabled=raw.get(
             "stage_enabled",
             {

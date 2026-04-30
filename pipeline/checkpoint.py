@@ -45,13 +45,12 @@ def confirm_checkpoint(
     print(f"  CHECKPOINT: {stage_name.upper()}")
     print(f"{'='*60}")
 
-    # Show AI review decision for review stage
+    # Show AI review decision for review stage (only AI PASS reaches this point)
     if stage_name == "review" and review_decision is not None:
-        ai_verdict = "✅ PASS" if review_decision.passed else "❌ FAIL"
-        print(f"\n  [AI REVIEW DECISION: {ai_verdict}]")
+        print("\n  [AI REVIEW DECISION: PASS]")
         print(f"  Reason: {review_decision.reason}")
         if review_decision.severity_issues:
-            print(f"  Critical Issues:")
+            print("  Potential Issues:")
             for issue in review_decision.severity_issues:
                 print(f"    - {issue}")
         print()
@@ -59,17 +58,12 @@ def confirm_checkpoint(
     print(content or "(empty)")
     print(f"{'='*60}")
 
-    # Different prompt based on AI decision
-    if stage_name == "review" and review_decision is not None:
-        if review_decision.passed:
-            print(f"  Y = Continue (Approve)")
-            print(f"  n = Reject with reason (will retry review)")
-        else:
-            print(f"  Y = Override AI and Continue (Use with caution)")
-            print(f"  n = Reject and Retry (code_gen will rerun)")
+    if stage_name == "solution":
+        print("  Y = Approve")
+        print("  n = Reject (will retry solution with your feedback)")
     else:
-        print(f"  Y = Continue (Approve)")
-        print(f"  n = Reject and Redo (with reason)")
+        print("  Y = Approve / Continue")
+        print("  n = Reject (review will re-run with stricter criteria)")
     print(f"{'='*60}")
 
     try:
@@ -80,8 +74,6 @@ def confirm_checkpoint(
 
     if raw.lower() in ("y", "yes") or raw == "":
         return CheckpointResult(decision=CheckpointDecision.APPROVE)
-
-    resp = raw.lower()
 
     # Reject — ask for reason
     try:

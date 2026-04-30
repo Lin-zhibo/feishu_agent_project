@@ -10,7 +10,7 @@ SYSTEM = (
 )
 
 USER = (
-    "## Code Changes\n{input}\n\n"
+    "## Context\n{input}\n\n"
     "## Task\n"
     "Review the code and produce a structured review report with:\n"
     "1) Issues found (severity: CRITICAL/HIGH/MEDIUM/LOW),\n"

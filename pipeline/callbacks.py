@@ -106,7 +106,6 @@ class PipelineCallbackHandler(BaseCallbackHandler):
         # Build the visual block
         stage_label = self.stage_name or "unknown"
         width = 60
-        top_bottom = "═" * (width + 2)
         stage_bar = f"─ Stage: {stage_label} ─".ljust(width, "─")
 
         lines = [

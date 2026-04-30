@@ -94,6 +94,10 @@ class PipelineState:
 
     Attributes:
         original_input: The raw user requirement string.
+        pipeline_id: Unique identifier for this pipeline run (timestamp-based).
+        current_stage_idx: Current stage index in STAGE_ORDER (for pause/resume).
+        paused_at: ISO timestamp when the pipeline was paused (None if not paused).
+        pause_reason: Human-readable reason for pausing.
         requirements: Output from the requirements analysis stage.
         solution: Output from the solution design stage.
         code_diff: Output from the code generation stage.
@@ -101,9 +105,14 @@ class PipelineState:
         review_report: Output from the code review stage.
         review_decision: AI review decision (passed/failed with reason).
         final_output: Output from the delivery integration stage.
+        human_feedback: Feedback from human checkpoint rejection.
     """
 
     original_input: str
+    pipeline_id: str = ""
+    current_stage_idx: int = 0
+    paused_at: str | None = None
+    pause_reason: str | None = None
     requirements: str | None = None
     solution: str | None = None
     code_diff: str | None = None
@@ -111,6 +120,7 @@ class PipelineState:
     review_report: str | None = None
     review_decision: ReviewDecision | None = None
     final_output: str | None = None
+    human_feedback: str | None = None
 
 
 @dataclass
@@ -139,4 +149,10 @@ class PipelineConfig:
     })
     output_dir: str = "out"
     skip_checkpoints: bool = False  # When True, skip all Y/n confirmations
-    allow_human_override_on_ai_fail: bool = False  # When AI FAIL, human can override to pass
+    max_total_time_ms: int = 600000  # Max cumulative LLM time across the pipeline (ms)
+    max_total_tokens: int = 50000   # Max cumulative LLM tokens across the pipeline
+    max_retry: int = 3              # Max LLM API call retries (before terminating)
+    temperature: float = 0.3        # LLM temperature (0.0 = deterministic, 2.0 = creative)
+    max_tool_iterations: int = 20   # Max tool-calling loop iterations per stage
+    preserve_session: bool = False  # Keep pause file after completion (for audit)
+    verbose: bool = False           # Log full LLM request/response content

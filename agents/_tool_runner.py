@@ -14,6 +14,7 @@ preservation of custom response fields.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -25,10 +26,22 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_openai import ChatOpenAI
+from openai import (
+    APIConnectionError,
+    APIError,
+    APITimeoutError,
+    InternalServerError,
+    RateLimitError,
+)
 
 _log = logging.getLogger("agents._tool_runner")
 
-MAX_TOOL_ITERATIONS = 20
+_RETRYABLE_ERRORS = (
+    RateLimitError,
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+)
 
 
 async def invoke_agent_with_tools(
@@ -38,6 +51,9 @@ async def invoke_agent_with_tools(
     inputs: dict[str, Any],
     callbacks: list[BaseCallbackHandler] | None = None,
     stream: bool = False,
+    max_retry: int = 3,
+    max_tool_iterations: int = 20,
+    verbose: bool = False,
 ) -> str:
     """
     Invoke an LLM agent with a tool-calling loop via raw API calls.
@@ -52,9 +68,16 @@ async def invoke_agent_with_tools(
         inputs: Dict of input variable values for the prompt template.
         callbacks: Optional list of LangChain callback handlers for metrics.
         stream: If True, print tool calls and final output to console.
+        max_retry: Max retries for LLM API transient failures (rate limit,
+                   connection, timeout, server error). Default 3.
+        max_tool_iterations: Max tool-calling loop iterations per stage.
+        verbose: If True, log full LLM request/response content.
 
     Returns:
         The final content string from the LLM after all tool calls are resolved.
+
+    Raises:
+        RuntimeError: If LLM API call fails after max_retry attempts.
     """
     prompt_text = prompt_template.invoke(inputs).to_string()
 
@@ -72,17 +95,30 @@ async def invoke_agent_with_tools(
         print(f"  [TOOLS] {', '.join(t.name for t in tools)}")
         print(f"{'='*70}")
 
-    for iteration in range(MAX_TOOL_ITERATIONS):
+    for iteration in range(max_tool_iterations):
+        if verbose:
+            _log.info("Agent loop iteration %d/%d, messages=%d", iteration + 1, max_tool_iterations, len(api_messages))
+
         _fire_llm_start(callbacks, api_messages)
 
-        response = await llm.async_client.create(
-            model=llm.model_name,
+        if verbose:
+            _log.info("LLM request: model=%s, tools=%d, messages=%s",
+                      llm.model_name, len(openai_tools or []), json.dumps(api_messages, ensure_ascii=False)[:500])
+
+        response = await _call_llm_with_retry(
+            llm=llm,
             messages=api_messages,
             tools=openai_tools,
-            temperature=llm.temperature,
+            max_retry=max_retry,
         )
 
         _fire_llm_end(callbacks, response)
+
+        if verbose:
+            choice = response.choices[0]
+            _log.info("LLM response: finish_reason=%s, content_len=%d, tool_calls=%d",
+                      choice.finish_reason, len(choice.message.content or ""),
+                      len(choice.message.tool_calls or []))
 
         choice = response.choices[0]
         msg = choice.message
@@ -135,9 +171,60 @@ async def invoke_agent_with_tools(
             _log.info("Agent loop ended after %d iterations", iteration + 1)
             return content
 
-    _log.warning("Max tool iterations (%d) reached, returning last response", MAX_TOOL_ITERATIONS)
+    _log.warning("Max tool iterations (%d) reached, returning last response", max_tool_iterations)
     last_msg = api_messages[-1]
     return last_msg.get("content", "") if isinstance(last_msg, dict) else ""
+
+
+# ---------------------------------------------------------------------------
+# API retry helper — exponential backoff for transient LLM errors.
+# ---------------------------------------------------------------------------
+
+async def _call_llm_with_retry(
+    llm: ChatOpenAI,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    max_retry: int,
+) -> Any:
+    """
+    Call the LLM API with exponential backoff retry for transient failures.
+
+    Args:
+        llm: ChatOpenAI instance.
+        messages: API message dicts.
+        tools: OpenAI-format tool definitions or None.
+        max_retry: Maximum total attempts (1 initial + max_retry retries).
+
+    Returns:
+        Raw API response object.
+
+    Raises:
+        RuntimeError: If all attempts exhausted.
+    """
+    last_error: Exception | None = None
+    for attempt in range(max_retry + 1):
+        try:
+            return await llm.async_client.create(
+                model=llm.model_name,
+                messages=messages,
+                tools=tools,
+                temperature=llm.temperature,
+            )
+        except _RETRYABLE_ERRORS as e:
+            last_error = e
+            if attempt < max_retry:
+                wait_s = 2 ** attempt  # 1s → 2s → 4s → ...
+                _log.warning(
+                    "LLM API retryable error (attempt %d/%d): %s. Retrying in %ds.",
+                    attempt + 1, max_retry + 1, e, wait_s,
+                )
+                await asyncio.sleep(wait_s)
+        except APIError as e:
+            # Non-retryable API errors (e.g., 400 Bad Request) → immediate raise
+            raise RuntimeError(f"LLM API error (terminal): {e}") from e
+    raise RuntimeError(
+        f"LLM API failed after {max_retry + 1} attempts. Last error: {last_error}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -1,14 +1,16 @@
 """
 Pipeline engine for the DevFlow Engine.
 
-Sequentially executes the 6 stages using LangChain RunnableSequence,
-with Human-in-the-Loop checkpoints at solution and review stages.
+Sequentially executes the 6 stages with Human-in-the-Loop checkpoints
+at solution and review stages. Supports pause/resume via disk checkpointing.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+from dataclasses import asdict
 from pathlib import Path
 
 from pipeline.callbacks import PipelineCallbackHandler
@@ -40,8 +42,185 @@ STAGE_ORDER = [
     "delivery",
 ]
 
-MAX_RETRY = 10
 
+# ---------------------------------------------------------------------------
+# Pause / Resume — state serialization
+# ---------------------------------------------------------------------------
+
+def _pause_file(output_dir: str, pipeline_id: str) -> Path:
+    """Return the path to the pause file for a given pipeline ID."""
+    return Path(output_dir) / f"pipeline_{pipeline_id}.json"
+
+
+def _save_paused_state(
+    state: PipelineState,
+    output_dir: str,
+    stage_idx: int,
+    reason: str,
+) -> None:
+    """Serialize PipelineState to disk for later resume."""
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    pause_path = _pause_file(output_dir, state.pipeline_id)
+    data = {
+        "pipeline_id": state.pipeline_id,
+        "original_input": state.original_input,
+        "current_stage_idx": stage_idx,
+        "paused_at": datetime.datetime.now().isoformat(),
+        "pause_reason": reason,
+        "state": {
+            "requirements": state.requirements,
+            "solution": state.solution,
+            "code_diff": state.code_diff,
+            "test_code": state.test_code,
+            "review_report": state.review_report,
+            "review_decision": asdict(state.review_decision) if state.review_decision else None,
+            "final_output": state.final_output,
+            "human_feedback": state.human_feedback,
+        },
+    }
+    pause_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    _log.info("Pipeline state saved to %s", pause_path)
+
+
+def _load_paused_state(output_dir: str, pipeline_id: str) -> tuple[PipelineState, int]:
+    """Load a paused PipelineState from disk. Returns (state, stage_idx)."""
+    pause_path = _pause_file(output_dir, pipeline_id)
+    if not pause_path.exists():
+        raise FileNotFoundError(f"Paused pipeline not found: {pause_path}")
+    data = json.loads(pause_path.read_text(encoding="utf-8"))
+    s = data["state"]
+    stage_idx = data["current_stage_idx"]
+
+    from pipeline.models import ReviewDecision
+    rd = None
+    if s.get("review_decision"):
+        rd = ReviewDecision(
+            passed=s["review_decision"]["passed"],
+            reason=s["review_decision"]["reason"],
+            severity_issues=s["review_decision"].get("severity_issues", []),
+        )
+
+    state = PipelineState(
+        original_input=data["original_input"],
+        pipeline_id=data["pipeline_id"],
+        requirements=s.get("requirements"),
+        solution=s.get("solution"),
+        code_diff=s.get("code_diff"),
+        test_code=s.get("test_code"),
+        review_report=s.get("review_report"),
+        review_decision=rd,
+        final_output=s.get("final_output"),
+        human_feedback=s.get("human_feedback"),
+    )
+    return state, stage_idx
+
+
+def _delete_paused_state(output_dir: str, pipeline_id: str) -> bool:
+    """Delete a paused pipeline file. Returns True if deleted."""
+    pause_path = _pause_file(output_dir, pipeline_id)
+    if pause_path.exists():
+        pause_path.unlink()
+        return True
+    return False
+
+
+def _cleanup_paused_state(state: PipelineState, output_dir: str) -> None:
+    """Remove pause file after successful pipeline completion."""
+    _delete_paused_state(output_dir, state.pipeline_id)
+
+
+def list_paused(output_dir: str) -> list[dict]:
+    """List all paused pipelines in the output directory."""
+    out_path = Path(output_dir)
+    if not out_path.exists():
+        return []
+    results = []
+    for f in sorted(out_path.glob("pipeline_*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            results.append({
+                "pipeline_id": data["pipeline_id"],
+                "original_input": data["original_input"][:80],
+                "paused_at": data.get("paused_at", ""),
+                "pause_reason": data.get("pause_reason", ""),
+            })
+        except Exception:
+            pass
+    return results
+
+
+def terminate_all_paused(output_dir: str) -> int:
+    """Delete all paused pipeline files. Returns count of deleted files."""
+    out_path = Path(output_dir)
+    if not out_path.exists():
+        return 0
+    count = 0
+    for f in out_path.glob("pipeline_*.json"):
+        f.unlink()
+        count += 1
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Budget check — pauses instead of crashing
+# ---------------------------------------------------------------------------
+
+def _try_pause(
+    handler: PipelineCallbackHandler,
+    config: PipelineConfig,
+    state: PipelineState,
+    stage_idx: int,
+) -> bool:
+    """
+    Check time/token budgets. If exceeded, save state and return True.
+
+    Args:
+        handler: Callback handler with cumulative totals.
+        config: Pipeline configuration with budget thresholds.
+        state: Current PipelineState to save.
+        stage_idx: Current stage index (where to resume).
+
+    Returns:
+        True if pipeline was paused (caller should exit gracefully).
+        False if budgets are OK.
+    """
+    if handler.total_time_ms >= config.max_total_time_ms:
+        reason = (
+            f"Time budget exceeded: {handler.total_time_ms:,.0f}ms >= {config.max_total_time_ms:,}ms"
+        )
+        _save_paused_state(state, config.output_dir, stage_idx, reason)
+        print(f"\n{'='*60}")
+        print("  PIPELINE PAUSED")
+        print(f"{'='*60}")
+        print(f"  {reason}")
+        print(f"  Resume:  python cli.py --resume {state.pipeline_id}")
+        print("  List:    python cli.py --list")
+        print(f"  Terminate: python cli.py --terminate {state.pipeline_id}")
+        print(f"{'='*60}\n")
+        return True
+
+    if handler.total_tokens >= config.max_total_tokens:
+        reason = (
+            f"Token budget exceeded: {handler.total_tokens:,} >= {config.max_total_tokens:,}"
+        )
+        _save_paused_state(state, config.output_dir, stage_idx, reason)
+        print(f"\n{'='*60}")
+        print("  PIPELINE PAUSED")
+        print(f"{'='*60}")
+        print(f"  {reason}")
+        print(f"  Resume:  python cli.py --resume {state.pipeline_id}")
+        print("  List:    python cli.py --list")
+        print(f"  Terminate: python cli.py --terminate {state.pipeline_id}")
+        print(f"{'='*60}\n")
+        return True
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Pipeline runner
+# ---------------------------------------------------------------------------
 
 async def run(input_text: str, config: PipelineConfig) -> PipelineState:
     """
@@ -54,16 +233,14 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
     Returns:
         PipelineState with all stage outputs filled in.
     """
-    _log.info("Pipeline started: input='%s'", input_text)
-
-    state = PipelineState(original_input=input_text)
+    pipeline_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    state = PipelineState(original_input=input_text, pipeline_id=pipeline_id)
     previous_output: dict | None = None
 
     handler = PipelineCallbackHandler()
     PipelineCallbackHandler.reset_totals()
 
     stage_idx = 0
-    retry_counts: dict[str, int] = {"solution": 0, "review": 0}
 
     while stage_idx < len(STAGE_ORDER):
         stage_name = STAGE_ORDER[stage_idx]
@@ -116,79 +293,84 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
         if stage_name == "solution":
             decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, config.output_dir)
             if decision.decision == CheckpointDecision.REJECT:
-                if retry_counts["solution"] >= MAX_RETRY:
-                    raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'solution'. Pipeline terminated.")
-                retry_counts["solution"] += 1
-                _log.warning("Solution rejected (attempt %d). Retrying with requirements.", retry_counts["solution"])
+                if _try_pause(handler, config, state, stage_idx):
+                    _log.info("Pipeline paused after solution checkpoint rejection")
+                    state.current_stage_idx = stage_idx
+                    return state
+                _log.warning("Solution rejected. Retrying with human feedback.")
                 state.solution = None
                 state.code_diff = None
                 state.test_code = None
                 state.review_report = None
                 state.final_output = None
+                state.human_feedback = decision.reason or "No reason provided"
                 # Jump back to solution
                 stage_idx = STAGE_ORDER.index("solution")
                 continue
+            else:
+                state.human_feedback = None
 
         # Checkpoint after "review"
         if stage_name == "review":
-            # Log AI review decision
-            if state.review_decision:
-                _log.info(
-                    "AI Review Decision: %s | Reason: %s | Critical Issues: %s",
-                    "PASS" if state.review_decision.passed else "FAIL",
-                    state.review_decision.reason,
-                    state.review_decision.severity_issues or [],
-                )
+            rd = state.review_decision
 
+            if rd and not rd.passed:
+                # AI FAIL → auto retry code_gen (human never sees this)
+                if _try_pause(handler, config, state, stage_idx):
+                    _log.info("Pipeline paused after AI FAIL auto-retry")
+                    state.current_stage_idx = stage_idx
+                    return state
+                _log.warning(
+                    "Review: AI FAIL → auto retry code_gen. Reason: %s | Issues: %s",
+                    rd.reason,
+                    rd.severity_issues or [],
+                )
+                feedback_parts = [f"AI 评审发现代码问题，拒绝通过。\n拒绝理由：{rd.reason}"]
+                if rd.severity_issues:
+                    feedback_parts.append(f"严重问题：{', '.join(rd.severity_issues)}")
+                state.human_feedback = "\n".join(feedback_parts)
+                state.code_diff = None
+                state.test_code = None
+                state.review_report = None
+                state.final_output = None
+                stage_idx = STAGE_ORDER.index("code_gen")
+                continue
+
+            # AI PASS → human checkpoint
             decision = confirm_checkpoint(
                 "review",
                 state.review_report or "",
                 config.skip_checkpoints,
                 config.output_dir,
-                review_decision=state.review_decision,
+                review_decision=rd,
             )
 
-            # State machine for review checkpoint
-            ai_passed = state.review_decision.passed if state.review_decision else True
-
-            if decision.decision == CheckpointDecision.APPROVE:
-                if ai_passed:
-                    # AI PASS + Human Approve → delivery
-                    _log.info("Review: AI PASS + Human Approve → delivery")
-                else:
-                    # AI FAIL + Human Override (allow_human_override) → delivery
-                    if config.allow_human_override_on_ai_fail:
-                        _log.info("Review: AI FAIL + Human Override → delivery (recorded)")
-                    else:
-                        # Should not happen if config is correct, but guard anyway
-                        _log.warning("Review: AI FAIL but Human Approve without override flag - treating as override")
+            if decision.decision == CheckpointDecision.REJECT:
+                # Human rejected AI PASS → retry review with stricter criteria
+                if _try_pause(handler, config, state, stage_idx):
+                    _log.info("Pipeline paused after review human rejection")
+                    state.current_stage_idx = stage_idx
+                    return state
+                _log.warning("Review: AI PASS but human rejected. Retrying with stricter criteria.")
+                reason_text = f" 拒绝理由：{decision.reason}" if decision.reason else ""
+                state.human_feedback = (
+                    f"人类审核员拒绝通过。{reason_text}"
+                    " 请重新严格审查代码，必须输出 FAIL 裁决，"
+                    "针对每个发现的问题给出具体的代码级修复方案。"
+                )
+                state.review_report = None
+                stage_idx = STAGE_ORDER.index("review")
+                continue
             else:
-                # Human Rejected
-                if ai_passed:
-                    # AI PASS + Human Reject → retry review with human feedback
-                    if retry_counts["review"] >= MAX_RETRY:
-                        raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'review'. Pipeline terminated.")
-                    retry_counts["review"] += 1
-                    _log.warning("Review rejected by human (attempt %d). Retrying review with feedback.", retry_counts["review"])
-                    state.review_report = None
-                    # Jump back to review
-                    stage_idx = STAGE_ORDER.index("review")
-                    continue
-                else:
-                    # AI FAIL + Human Reject → code_gen
-                    if retry_counts["review"] >= MAX_RETRY:
-                        raise RuntimeError(f"Max retry ({MAX_RETRY}) reached for 'review'. Pipeline terminated.")
-                    retry_counts["review"] += 1
-                    _log.warning("Review AI FAIL + human reject (attempt %d). Retrying code_gen.", retry_counts["review"])
-                    state.code_diff = None
-                    state.test_code = None
-                    state.review_report = None
-                    state.final_output = None
-                    # Jump back to code_gen
-                    stage_idx = STAGE_ORDER.index("code_gen")
-                    continue
+                state.human_feedback = None
+                # → delivery
 
         stage_idx += 1
+
+    if not config.preserve_session:
+        _cleanup_paused_state(state, config.output_dir)
+    else:
+        _log.info("preserve_session=true, keeping pause file %s", _pause_file(config.output_dir, state.pipeline_id))
 
     _log.info(
         "\n═══════════════════════════════════════════════════════\n"
@@ -204,6 +386,157 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
     _log.info("Pipeline finished")
     return state
 
+
+async def resume(pipeline_id: str, config: PipelineConfig) -> PipelineState:
+    """
+    Resume a previously paused pipeline.
+
+    Args:
+        pipeline_id: The pipeline ID to resume (matches pause filename).
+        config: Global pipeline configuration (re-read from settings.json).
+
+    Returns:
+        PipelineState after completion.
+
+    Raises:
+        FileNotFoundError: If paused pipeline file does not exist.
+    """
+    state, stage_idx = _load_paused_state(config.output_dir, pipeline_id)
+    _log.info("Resuming pipeline '%s' from stage %d (%s)", pipeline_id, stage_idx, STAGE_ORDER[stage_idx])
+
+    print(f"\n{'='*60}")
+    print(f"  RESUMING PIPELINE: {pipeline_id}")
+    print(f"  Original: {state.original_input}")
+    print(f"  Stage:    {STAGE_ORDER[stage_idx]}")
+    print(f"  Paused:   {state.paused_at}")
+    print(f"  Reason:   {state.pause_reason}")
+    print(f"{'='*60}\n")
+
+    previous_output = {
+        "requirements": state.requirements or "",
+        "solution": state.solution or "",
+        "code_diff": state.code_diff or "",
+        "test_code": state.test_code or "",
+        "review_report": state.review_report or "",
+    }
+
+    handler = PipelineCallbackHandler()
+    # Note: cumulative totals are reset on resume — budget is per-run
+    PipelineCallbackHandler.reset_totals()
+
+    while stage_idx < len(STAGE_ORDER):
+        stage_name = STAGE_ORDER[stage_idx]
+
+        if not config.stage_enabled.get(stage_name, True):
+            _log.info("Stage '%s' skipped (disabled)", stage_name)
+            stage_idx += 1
+            continue
+
+        agent = _get_agent(stage_name)
+        if agent is None:
+            _log.warning("No agent found for stage '%s'", stage_name)
+            stage_idx += 1
+            continue
+
+        current_input = _get_current_input(stage_name, state.original_input, state)
+        _log.info("Stage '%s' starting (resume), input length=%d", stage_name, len(current_input))
+
+        inp = StageInput(
+            stage_name=stage_name,
+            previous_output=previous_output,
+            current_input=current_input,
+            config=config,
+        )
+
+        handler.stage_name = stage_name
+        output = await agent(inp, callbacks=[handler], stream=True)
+        _update_state(state, stage_name, output)
+
+        previous_output = {
+            "requirements": state.requirements or "",
+            "solution": state.solution or "",
+            "code_diff": state.code_diff or "",
+            "test_code": state.test_code or "",
+            "review_report": state.review_report or "",
+        }
+
+        await _write_output(config.output_dir, stage_name, output)
+        _print_stage_output(stage_name, output, config.output_dir)
+
+        # Checkpoint after "solution"
+        if stage_name == "solution":
+            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, config.output_dir)
+            if decision.decision == CheckpointDecision.REJECT:
+                if _try_pause(handler, config, state, stage_idx):
+                    _log.info("Pipeline paused after solution checkpoint rejection (resume)")
+                    state.current_stage_idx = stage_idx
+                    return state
+                state.solution = None
+                state.code_diff = None
+                state.test_code = None
+                state.review_report = None
+                state.final_output = None
+                state.human_feedback = decision.reason or "No reason provided"
+                stage_idx = STAGE_ORDER.index("solution")
+                continue
+            else:
+                state.human_feedback = None
+
+        # Checkpoint after "review"
+        if stage_name == "review":
+            rd = state.review_decision
+
+            if rd and not rd.passed:
+                if _try_pause(handler, config, state, stage_idx):
+                    _log.info("Pipeline paused after AI FAIL auto-retry (resume)")
+                    state.current_stage_idx = stage_idx
+                    return state
+                feedback_parts = [f"AI 评审发现代码问题，拒绝通过。\n拒绝理由：{rd.reason}"]
+                if rd.severity_issues:
+                    feedback_parts.append(f"严重问题：{', '.join(rd.severity_issues)}")
+                state.human_feedback = "\n".join(feedback_parts)
+                state.code_diff = None
+                state.test_code = None
+                state.review_report = None
+                state.final_output = None
+                stage_idx = STAGE_ORDER.index("code_gen")
+                continue
+
+            decision = confirm_checkpoint(
+                "review", state.review_report or "", config.skip_checkpoints,
+                config.output_dir, review_decision=rd,
+            )
+
+            if decision.decision == CheckpointDecision.REJECT:
+                if _try_pause(handler, config, state, stage_idx):
+                    _log.info("Pipeline paused after review human rejection (resume)")
+                    state.current_stage_idx = stage_idx
+                    return state
+                reason_text = f" 拒绝理由：{decision.reason}" if decision.reason else ""
+                state.human_feedback = (
+                    f"人类审核员拒绝通过。{reason_text}"
+                    " 请重新严格审查代码，必须输出 FAIL 裁决，"
+                    "针对每个发现的问题给出具体的代码级修复方案。"
+                )
+                state.review_report = None
+                stage_idx = STAGE_ORDER.index("review")
+                continue
+            else:
+                state.human_feedback = None
+
+        stage_idx += 1
+
+    if not config.preserve_session:
+        _cleanup_paused_state(state, config.output_dir)
+    else:
+        _log.info("preserve_session=true, keeping pause file %s", _pause_file(config.output_dir, state.pipeline_id))
+    _log.info("Pipeline resumed and finished")
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _get_agent(stage_name: str):
     """Get the agent async function for a stage."""
@@ -223,9 +556,39 @@ def _get_current_input(stage_name: str, original_input: str, state: PipelineStat
     if stage_name == "requirements":
         return original_input
     if stage_name == "solution":
-        return state.requirements or ""
-    if stage_name in ("code_gen", "test_gen", "review"):
-        return getattr(state, "solution", "") or ""
+        base = state.requirements or ""
+        if state.human_feedback:
+            return (
+                base
+                + "\n\n---\n## 人类反馈（上一版被拒绝）\n"
+                + f"拒绝理由：{state.human_feedback}\n"
+                + "请基于以上反馈重新设计方案，解决指出的问题。"
+            )
+        return base
+    if stage_name == "code_gen":
+        base = state.solution or ""
+        if state.human_feedback:
+            return base + "\n\n---\n## 反馈\n" + state.human_feedback
+        return base
+
+    if stage_name == "test_gen":
+        base = (
+            "## Solution Design\n" + (state.solution or "")
+            + "\n\n## Code Changes\n" + (state.code_diff or "")
+        )
+        if state.human_feedback:
+            return base + "\n\n---\n## 反馈\n" + state.human_feedback
+        return base
+
+    if stage_name == "review":
+        base = (
+            "## Solution Design\n" + (state.solution or "")
+            + "\n\n## Code Diff\n" + (state.code_diff or "")
+            + "\n\n## Test Code\n" + (state.test_code or "")
+        )
+        if state.human_feedback:
+            return base + "\n\n---\n## 反馈\n" + state.human_feedback
+        return base
     if stage_name == "delivery":
         return ""
     return original_input

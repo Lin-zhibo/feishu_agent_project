@@ -1,13 +1,11 @@
 {
     "output_dir": "out",
     "skip_checkpoints": false,
-    "allow_human_override_on_ai_fail": false,
-    "stage_enabled": {
-        "requirements": true,
-        "solution": true,
-        "code_gen": true,
-        "test_gen": true,
-        "review": true,
-        "delivery": true
-    }
+    "max_total_time_ms": 600000,
+    "max_total_tokens": 50000,
+    "max_retry": 3,
+    "temperature": 0.3,
+    "max_tool_iterations": 20,
+    "preserve_session": false,
+    "verbose": false
 }

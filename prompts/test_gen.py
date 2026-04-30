@@ -10,7 +10,7 @@ SYSTEM = (
 )
 
 USER = (
-    "## Code Changes\n{input}\n\n"
+    "## Context\n{input}\n\n"
     "## Task\n"
     "Generate pytest unit tests and integration tests covering the code changes."
 )

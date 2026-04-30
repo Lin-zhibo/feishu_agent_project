@@ -16,6 +16,27 @@
   - 支持 `1,3,5` 数字索引和 `收入/支出记录, 分类管理` 文本两种输入方式
   - 19 个测试全部通过
 
+- **Checkpoint 流程重构 + 资源预算控制 + 暂停/恢复 + LLM 重试**：
+  - Review 简化：AI FAIL → 自动跳 code_gen；AI PASS → 人类审批（Y→delivery / n→review 重跑强制 FAIL+修复方案）
+  - Solution：拒绝理由通过 `human_feedback` 注入 agent 输入
+  - 预算超限 → 暂停写盘（`out/pipeline_<id>.json`），可通过 `--resume` 恢复
+  - LLM API 瞬态故障 → `max_retry`=3 指数退避重试（1s/2s/4s），耗尽 → RuntimeError 终止
+  - 新增 CLI：`--resume [id]` / `--list` / `--terminate <id>` / `--terminate-all`
+  - `settings.json` 新增 `max_retry: 3`；删除 `allow_human_override_on_ai_fail`
+  - `PipelineState` 新增 `pipeline_id` / `current_stage_idx` / `paused_at` / `pause_reason`
+  - `engine.py` 新增 `resume()` + `_try_pause()` + pause 文件管理 helpers
+  - `_tool_runner.py` 新增 `_call_llm_with_retry()` 指数退避
+  - 19 个测试全部通过，ruff 零告警
+
+- **新增 4 个用户配置项 + 删除 stage_enabled**：
+  - `config/settings.json`：新增 `temperature: 0.3` / `max_tool_iterations: 20` / `preserve_session: false` / `verbose: false`；删除 `stage_enabled` 块
+  - `pipeline/models.py`：`PipelineConfig` 新增对应 4 个字段
+  - `pipeline/config_loader.py`：加载 4 个新字段
+  - `agents/_tool_runner.py`：`invoke_agent_with_tools()` 新增 `max_tool_iterations` / `verbose` 参数，删除 `MAX_TOOL_ITERATIONS` 常量；`verbose` 时打全量 LLM 请求响应日志
+  - 6 个 `agents/*.py`：`ChatOpenAI` 构造改为 `temperature=inp.config.temperature`；`invoke_agent_with_tools()` 调用新增 `max_tool_iterations=inp.config.max_tool_iterations` / `verbose=inp.config.verbose`
+  - `pipeline/engine.py`：`preserve_session`=true 时跳过 `_cleanup_paused_state`
+  - 19 个测试全部通过，ruff 零告警
+
 - **文件交互工具增强 + 新增 Glob/Grep/Bash**：
   - `tools/file_ops.py`：`Read` 新增 `offset`/`limit` 参数、二进制检测；`Edit` 新增 `replace_all` 参数
   - 新增 `tools/glob.py`（`Glob`）：文件模式匹配，自动跳过 .git/node_modules 等目录，限 200 条
