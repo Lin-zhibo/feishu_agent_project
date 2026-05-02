@@ -1,33 +1,40 @@
-我现在前端公网页面已经部署好了：
-https://feishu-agent-project.vercel.app
+最终版前端会按正式 Pipeline 控制台来做。
 
-目前只完成了前端公网部署，后端公网接口还没接。
+接口先定成下面这一套：
 
-接口我先定为：
-POST /api/run
+1. 获取 Pipeline 配置
+   `GET /api/pipeline/config`
 
-前端请求体：
+2. 获取 Agent 配置
+   `GET /api/agents`
 
-```json
-{
-  "input": "用户输入的需求文本"
-}
-```
+3. 获取 LLM Provider
+   `GET /api/providers`
 
-后端返回六个阶段结果：
+4. 启动 Pipeline
+   `POST /api/pipeline/runs`
 
-```json
-{
-  "success": true,
-  "message": "运行成功",
-  "stages": {
-    "requirements": "需求分析阶段输出",
-    "solution": "方案设计阶段输出",
-    "code_gen": "代码生成阶段输出",
-    "test_gen": "测试生成阶段输出",
-    "review": "代码审查阶段输出",
-    "delivery": "交付集成阶段输出"
-  },
-  "final_output": "最终汇总结果"
-}
-```
+5. 查询运行状态
+   `GET /api/pipeline/runs/{run_id}`
+
+6. 暂停
+   `POST /api/pipeline/runs/{run_id}/pause`
+
+7. 恢复
+   `POST /api/pipeline/runs/{run_id}/resume`
+
+8. 终止
+   `POST /api/pipeline/runs/{run_id}/terminate`
+
+9. 检查点通过
+   `POST /api/pipeline/runs/{run_id}/checkpoints/{checkpoint_id}/approve`
+
+10. 检查点驳回
+    `POST /api/pipeline/runs/{run_id}/checkpoints/{checkpoint_id}/reject`
+
+前端公网地址是：
+
+`https://feishu-agent-project.vercel.app`
+
+后端需要允许这个地址跨域访问。
+
