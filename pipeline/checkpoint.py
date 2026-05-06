@@ -1,14 +1,19 @@
 """
 Checkpoint confirmation for Human-in-the-Loop approval.
 
-Displays stage output and prompts Y/n confirmation.
+Supports two modes:
+- CLI: interactive input()
+- API: asyncio.Event-based waiting
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from pipeline.models import CheckpointDecision, CheckpointResult, ReviewDecision
+
+_log = logging.getLogger("pipeline.checkpoint")
 
 
 def confirm_checkpoint(
@@ -83,3 +88,43 @@ def confirm_checkpoint(
         return CheckpointResult(decision=CheckpointDecision.APPROVE)
 
     return CheckpointResult(decision=CheckpointDecision.REJECT, reason=reason)
+
+
+async def api_confirm_checkpoint(
+    stage_name: str,
+    content: str,
+    output_dir: str,
+    runtime,
+) -> CheckpointResult:
+    """
+    API-mode checkpoint: wait for external approve/reject via asyncio.Event.
+
+    Args:
+        stage_name: Name of current stage.
+        content: Stage output content.
+        output_dir: Log directory.
+        runtime: PipelineRuntime instance (has checkpoint_event and checkpoint_result).
+
+    Returns:
+        CheckpointResult from the API handler.
+    """
+    # Write content to log dir so API can serve it
+    content_file = Path(output_dir) / f"{stage_name}.md"
+    content_file.parent.mkdir(parents=True, exist_ok=True)
+    content_file.write_text(content, encoding="utf-8")
+
+    # Prepare checkpoint
+    runtime.prepare_checkpoint()
+
+    _log.info("API checkpoint [%s] waiting for approval...", stage_name)
+
+    # Block until API handler sets the event
+    await runtime.checkpoint_event.wait()
+
+    result = runtime.checkpoint_result.get("result")
+    if result is None:
+        _log.warning("Checkpoint event set without result, defaulting to APPROVE")
+        return CheckpointResult(decision=CheckpointDecision.APPROVE)
+
+    _log.info("API checkpoint [%s] resolved: %s", stage_name, result.decision)
+    return result

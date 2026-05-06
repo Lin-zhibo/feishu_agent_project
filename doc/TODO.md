@@ -110,11 +110,12 @@
 ### 功能一：必须完成项
 
 - [ ] **1.4 API-First 架构**：Golang 实现 RESTful API（12 端点）+ Swagger/OpenAPI 文档
-  - 技术栈：Golang + Gin/Chi + asyncio subprocess 调用 Python engine
-  - 新增 `backend/` 目录（`main.go`, `api/`, `models/`, `registry.go`）
-  - Pipeline 运行时注册表（`registry.go`）管理活跃 Pipeline 生命周期
-  - Checkpoint `input()` → 替换为 `asyncio.Event` 等待 API 审批调用
-  - SSE/轮询 推送 Pipeline 状态变更
+  - ⚠️ 已用 FastAPI 替代（Python 全栈，零跨语言开销）
+  - 新增 `backend/` 目录（`main.py`, `api/`, `models/`, `registry.py`, `engine_bridge.py`）
+  - 12 个端点已实现 + SSE 实时推送
+  - `pipeline/checkpoint.py`：新增 `api_confirm_checkpoint()`（asyncio.Event 等待 API 审批）
+  - `pipeline/engine.py`：`run()` 新增 `runtime` 参数支持 API/CLI 双模式
+  - 16 端点（含 SSE stream + 2 内部 stage 操作）
 
 - [ ] **1.5 端到端演示**：完整 Pipeline 运行 + workspace 交付可运行代码
   - 真实 API Key 端到端测试

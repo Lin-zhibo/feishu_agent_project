@@ -14,7 +14,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from pipeline.callbacks import PipelineCallbackHandler
-from pipeline.checkpoint import confirm_checkpoint
+from pipeline.checkpoint import api_confirm_checkpoint, confirm_checkpoint
 from pipeline.models import (
     CheckpointDecision,
     PipelineConfig,
@@ -177,6 +177,7 @@ def _try_pause(
     config: PipelineConfig,
     state: PipelineState,
     stage_idx: int,
+    runtime=None,
 ) -> bool:
     """
     Check time/token budgets. If exceeded, save state and return True.
@@ -186,6 +187,7 @@ def _try_pause(
         config: Pipeline configuration with budget thresholds.
         state: Current PipelineState to save.
         stage_idx: Current stage index (where to resume).
+        runtime: Optional PipelineRuntime for API mode.
 
     Returns:
         True if pipeline was paused (caller should exit gracefully).
@@ -196,14 +198,19 @@ def _try_pause(
             f"Time budget exceeded: {handler.total_time_ms:,.0f}ms >= {config.max_total_time_ms:,}ms"
         )
         _save_paused_state(state, config.log_dir, stage_idx, reason)
-        print(f"\n{'='*60}")
-        print("  PIPELINE PAUSED")
-        print(f"{'='*60}")
-        print(f"  {reason}")
-        print(f"  Resume:  python cli.py --resume {state.pipeline_id}")
-        print("  List:    python cli.py --list")
-        print(f"  Terminate: python cli.py --terminate {state.pipeline_id}")
-        print(f"{'='*60}\n")
+        if runtime:
+            runtime.status = "paused"
+            state.paused_at = datetime.datetime.now().isoformat()
+            state.pause_reason = reason
+        else:
+            print(f"\n{'='*60}")
+            print("  PIPELINE PAUSED")
+            print(f"{'='*60}")
+            print(f"  {reason}")
+            print(f"  Resume:  python cli.py --resume {state.pipeline_id}")
+            print("  List:    python cli.py --list")
+            print(f"  Terminate: python cli.py --terminate {state.pipeline_id}")
+            print(f"{'='*60}\n")
         return True
 
     if handler.total_tokens >= config.max_total_tokens:
@@ -211,14 +218,19 @@ def _try_pause(
             f"Token budget exceeded: {handler.total_tokens:,} >= {config.max_total_tokens:,}"
         )
         _save_paused_state(state, config.log_dir, stage_idx, reason)
-        print(f"\n{'='*60}")
-        print("  PIPELINE PAUSED")
-        print(f"{'='*60}")
-        print(f"  {reason}")
-        print(f"  Resume:  python cli.py --resume {state.pipeline_id}")
-        print("  List:    python cli.py --list")
-        print(f"  Terminate: python cli.py --terminate {state.pipeline_id}")
-        print(f"{'='*60}\n")
+        if runtime:
+            runtime.status = "paused"
+            state.paused_at = datetime.datetime.now().isoformat()
+            state.pause_reason = reason
+        else:
+            print(f"\n{'='*60}")
+            print("  PIPELINE PAUSED")
+            print(f"{'='*60}")
+            print(f"  {reason}")
+            print(f"  Resume:  python cli.py --resume {state.pipeline_id}")
+            print("  List:    python cli.py --list")
+            print(f"  Terminate: python cli.py --terminate {state.pipeline_id}")
+            print(f"{'='*60}\n")
         return True
 
     return False
@@ -228,13 +240,14 @@ def _try_pause(
 # Pipeline runner
 # ---------------------------------------------------------------------------
 
-async def run(input_text: str, config: PipelineConfig) -> PipelineState:
+async def run(input_text: str, config: PipelineConfig, runtime=None) -> PipelineState:
     """
     Run the full pipeline with checkpoint approvals.
 
     Args:
         input_text: The user's raw requirement string.
         config: Global pipeline configuration.
+        runtime: Optional PipelineRuntime for API mode (checkpoint via asyncio.Event).
 
     Returns:
         PipelineState with all stage outputs filled in.
@@ -246,6 +259,9 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
     Path(log_dir).mkdir(parents=True, exist_ok=True)
 
     state = PipelineState(original_input=input_text, pipeline_id=pipeline_id)
+    if runtime:
+        runtime.pipeline_state = state
+        runtime.status = "running"
     previous_output: dict | None = None
 
     handler = PipelineCallbackHandler()
@@ -268,6 +284,8 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
             continue
 
         current_input = _get_current_input(stage_name, input_text, state, workspace_dir)
+        if runtime:
+            runtime.current_stage = stage_name
         _log.info("Stage '%s' starting, input length=%d", stage_name, len(current_input))
 
         inp = StageInput(
@@ -303,9 +321,12 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
 
         # Checkpoint after "solution"
         if stage_name == "solution":
-            decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, log_dir)
+            if runtime:
+                decision = await api_confirm_checkpoint("solution", state.solution or "", log_dir, runtime)
+            else:
+                decision = confirm_checkpoint("solution", state.solution or "", config.skip_checkpoints, log_dir)
             if decision.decision == CheckpointDecision.REJECT:
-                if _try_pause(handler, config, state, stage_idx):
+                if _try_pause(handler, config, state, stage_idx, runtime):
                     _log.info("Pipeline paused after solution checkpoint rejection")
                     state.current_stage_idx = stage_idx
                     return state
@@ -316,6 +337,7 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
                 state.review_report = None
                 state.final_output = None
                 state.human_feedback = decision.reason or "No reason provided"
+                # Jump back to solution
                 stage_idx = STAGE_ORDER.index("solution")
                 continue
             else:
@@ -326,7 +348,7 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
             rd = state.review_decision
 
             if rd and not rd.passed:
-                if _try_pause(handler, config, state, stage_idx):
+                if _try_pause(handler, config, state, stage_idx, runtime):
                     _log.info("Pipeline paused after AI FAIL auto-retry")
                     state.current_stage_idx = stage_idx
                     return state
@@ -346,16 +368,19 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
                 stage_idx = STAGE_ORDER.index("code_gen")
                 continue
 
-            decision = confirm_checkpoint(
-                "review",
-                state.review_report or "",
-                config.skip_checkpoints,
-                log_dir,
-                review_decision=rd,
-            )
+            if runtime:
+                decision = await api_confirm_checkpoint("review", state.review_report or "", log_dir, runtime)
+            else:
+                decision = confirm_checkpoint(
+                    "review",
+                    state.review_report or "",
+                    config.skip_checkpoints,
+                    log_dir,
+                    review_decision=rd,
+                )
 
             if decision.decision == CheckpointDecision.REJECT:
-                if _try_pause(handler, config, state, stage_idx):
+                if _try_pause(handler, config, state, stage_idx, runtime):
                     _log.info("Pipeline paused after review human rejection")
                     state.current_stage_idx = stage_idx
                     return state
@@ -392,6 +417,10 @@ async def run(input_text: str, config: PipelineConfig) -> PipelineState:
         handler.total_tokens,
     )
     _log.info("Pipeline finished")
+    if runtime:
+        runtime.status = "completed"
+        runtime.total_time_ms = handler.total_time_ms
+        runtime.total_tokens = handler.total_tokens
     return state
 
 
